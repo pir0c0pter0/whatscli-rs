@@ -14,6 +14,9 @@ pub struct General {
     pub use_terminal_bell: bool,
     pub notification_timeout: i64,
     pub backlog_msg_quantity: i32,
+    pub history_sync_limit: usize,
+    pub log_level: String,
+    pub log_retention_days: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +78,7 @@ pub struct Config {
     pub colors: Colors,
     pub config_file: PathBuf,
     pub session_file: PathBuf,
+    pub startup_warnings: Vec<String>,
 }
 
 impl Default for Config {
@@ -93,6 +97,9 @@ impl Default for Config {
                 use_terminal_bell: false,
                 notification_timeout: 60,
                 backlog_msg_quantity: 10,
+                history_sync_limit: 200,
+                log_level: "info".into(),
+                log_retention_days: 7,
             },
             keymap: Keymap {
                 open_palette: "Ctrl+p".into(),
@@ -141,13 +148,17 @@ impl Default for Config {
             },
             config_file: config_dir.join("whatscli.config"),
             session_file: config_dir.join("session-rust.db"),
+            startup_warnings: Vec::new(),
         }
     }
 }
 
 impl Config {
     pub fn load() -> Result<Self> {
-        let mut config = Self::default();
+        Self::load_config(Self::default())
+    }
+
+    fn load_config(mut config: Self) -> Result<Self> {
         if let Some(parent) = config.config_file.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -180,6 +191,29 @@ impl Config {
                 s.get("backlog_msg_quantity"),
                 config.general.backlog_msg_quantity,
             );
+            config.general.history_sync_limit = number_value(
+                s.get("history_sync_limit"),
+                config.general.history_sync_limit,
+            );
+            if let Some(level) = s.get("log_level") {
+                let normalized = level.trim().to_ascii_lowercase();
+                if matches!(
+                    normalized.as_str(),
+                    "error" | "warn" | "info" | "debug" | "trace"
+                ) {
+                    config.general.log_level = normalized;
+                } else {
+                    config.general.log_level = "info".into();
+                    config
+                        .startup_warnings
+                        .push("invalid general.log_level; using info".into());
+                }
+            }
+            config.general.log_retention_days = number_value(
+                s.get("log_retention_days"),
+                config.general.log_retention_days,
+            )
+            .max(1);
         }
         if let Some(s) = ini.section(Some("keymap")) {
             macro_rules! key {
@@ -280,6 +314,15 @@ impl Config {
             .set(
                 "backlog_msg_quantity",
                 self.general.backlog_msg_quantity.to_string(),
+            )
+            .set(
+                "history_sync_limit",
+                self.general.history_sync_limit.to_string(),
+            )
+            .set("log_level", &self.general.log_level)
+            .set(
+                "log_retention_days",
+                self.general.log_retention_days.to_string(),
             );
         let keymap = &self.keymap;
         ini.with_section(Some("keymap"))
@@ -408,6 +451,27 @@ fn number_value<T: std::str::FromStr>(value: Option<&str>, default: T) -> T {
 #[cfg(test)]
 mod tests {
     use super::Config;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_config(contents: &str) -> (Config, PathBuf) {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("whatscli-config-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("whatscli.config");
+        fs::write(&path, contents).unwrap();
+        let defaults = Config {
+            config_file: path,
+            session_file: directory.join("session-rust.db"),
+            ..Default::default()
+        };
+        (Config::load_config(defaults).unwrap(), directory)
+    }
 
     #[test]
     fn defaults_preserve_legacy_command_prefix() {
@@ -424,5 +488,37 @@ mod tests {
         assert_eq!(config.keymap.open_palette, "Ctrl+p");
         assert_eq!(config.keymap.search_chats, "Ctrl+f");
         assert_eq!(config.colors, super::Colors::legacy_defaults());
+    }
+
+    #[test]
+    fn legacy_file_gets_sync_and_log_defaults_without_being_rewritten() {
+        let contents = "[general]\ncmd_prefix=!\n";
+        let (config, directory) = test_config(contents);
+        assert_eq!(config.general.history_sync_limit, 200);
+        assert_eq!(config.general.log_level, "info");
+        assert_eq!(config.general.log_retention_days, 7);
+        assert_eq!(fs::read_to_string(&config.config_file).unwrap(), contents);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn new_general_values_accept_unlimited_sync_and_clamp_retention() {
+        let contents = "[general]\nhistory_sync_limit=0\nlog_level=TRACE\nlog_retention_days=0\n";
+        let (config, directory) = test_config(contents);
+        assert_eq!(config.general.history_sync_limit, 0);
+        assert_eq!(config.general.log_level, "trace");
+        assert_eq!(config.general.log_retention_days, 1);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn invalid_log_level_falls_back_with_a_warning() {
+        let (config, directory) = test_config("[general]\nlog_level=verbose\n");
+        assert_eq!(config.general.log_level, "info");
+        assert_eq!(
+            config.startup_warnings,
+            ["invalid general.log_level; using info"]
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 }

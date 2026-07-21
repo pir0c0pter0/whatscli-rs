@@ -194,6 +194,11 @@ impl App {
                     expires_at: Instant::now() + Duration::from_secs(expires_in),
                 });
             }
+            UiEvent::ClearQr => {
+                if matches!(self.overlay, Some(Overlay::Pairing { .. })) {
+                    self.overlay = None;
+                }
+            }
         }
         Ok(())
     }
@@ -938,6 +943,25 @@ mod tests {
         .unwrap();
         assert!(app.overlay.is_none());
         assert_eq!(app.toast.as_ref().unwrap().kind, ToastKind::Success);
+    }
+
+    #[tokio::test]
+    async fn clear_qr_event_removes_pairing_overlay_while_connecting() {
+        let mut app = test_app();
+        app.status.state = ConnectionState::Pairing;
+        app.overlay = Some(Overlay::Pairing {
+            code: "qr".into(),
+            expires_at: Instant::now() + Duration::from_secs(30),
+        });
+        app.handle_ui_event(UiEvent::ClearQr).await.unwrap();
+        app.handle_ui_event(UiEvent::Status(SessionStatus {
+            state: ConnectionState::Connecting,
+            last_seen: String::new(),
+        }))
+        .await
+        .unwrap();
+        assert!(app.overlay.is_none());
+        assert_eq!(app.status.state, ConnectionState::Connecting);
     }
 
     #[tokio::test]

@@ -18,5 +18,11 @@ async fn main() -> Result<()> {
         }
         _ => {}
     }
-    App::new(Config::load()?).await?.run().await
+    let config = Config::load()?;
+    whatscli::logging::init(&config)?;
+    for warning in &config.startup_warnings {
+        log::warn!("{warning}");
+    }
+    log::info!("application starting");
+    App::new(config).await?.run().await
 }

@@ -3151,11 +3151,13 @@ version = "1.1.5"
 dependencies = [
  "anyhow",
  "arboard",
+ "async-channel",
  "chrono",
  "crossterm",
  "dirs",
  "futures-util",
  "insta",
+ "log",
  "mime_guess",
  "notify-rust",
  "open",
@@ -3168,6 +3170,7 @@ dependencies = [
  "tokio",
  "unicode-segmentation",
  "unicode-width 0.2.0",
+ "ureq",
  "whatsapp-rust",
 ]
 

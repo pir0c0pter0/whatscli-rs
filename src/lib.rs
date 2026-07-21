@@ -1,5 +1,6 @@
 pub mod app;
 pub mod config;
+pub mod logging;
 pub mod model;
 pub mod qr;
 pub mod session;

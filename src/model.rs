@@ -227,6 +227,7 @@ pub enum UiEvent {
     ColorList,
     Error(String),
     Qr { code: String, expires_in: u64 },
+    ClearQr,
 }
 
 #[cfg(test)]

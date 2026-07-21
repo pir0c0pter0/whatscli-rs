@@ -10,6 +10,7 @@ repository = "https://github.com/Pir0c0pter0/whatscli-rs"
 [dependencies]
 anyhow = "1.0"
 arboard = "3.6"
+async-channel = "2.5"
 chrono = { version = "0.4", features = ["clock"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
 dirs = "6.0"
@@ -22,10 +23,12 @@ ratatui = "0.29"
 regex = "1.11"
 rust-ini = "0.21"
 shell-words = "1.1"
+log = "0.4"
 tokio = { version = "1.47", features = ["fs", "macros", "rt-multi-thread", "signal", "sync", "time"] }
 textwrap = "0.16"
 unicode-segmentation = "1.12"
 unicode-width = "0.2"
+ureq = { version = "3.3", default-features = false, features = ["rustls"] }
 whatsapp-rust = { version = "=0.6.0", default-features = false, features = ["sqlite-storage", "tokio-transport", "tokio-runtime", "ureq-client", "tokio-native"] }
 
 [dev-dependencies]

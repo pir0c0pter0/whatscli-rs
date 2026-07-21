@@ -109,6 +109,26 @@ Images can be rendered through an external command such as `jp2a`; configure `sh
 Downloads and previews use `download_path` and `preview_path`. Desktop notifications are enabled
 with `enable_notifications = true`, or use `use_terminal_bell = true`.
 
+History and logging settings live in `[general]`:
+
+```ini
+[general]
+history_sync_limit = 200  ; automatic limit per conversation; 0 is unlimited
+log_level = info          ; error, warn, info, debug, or trace
+log_retention_days = 7    ; daily files retained; minimum 1
+```
+
+Automatic history synchronization keeps only the most recent `history_sync_limit` messages in
+each conversation to bound permanent memory use. `/backlog` requests produce `ON_DEMAND` batches,
+which are never truncated by this automatic limit and can extend the selected conversation
+explicitly. The unread count remains the server-provided value even when older unread messages are
+outside the local window.
+
+Logs are written to `~/.config/whatscli/logs/whatscli.YYYY-MM-DD.log`, rotate daily and retain the
+configured number of files. Logs contain event types, states, queue measurements, history counts,
+durations and errors, but never QR contents, JIDs, contact names, message text, media URLs or raw
+protocol payloads. Invalid `log_level` values fall back to `info` with a warning.
+
 The optional UI settings are:
 
 ```ini
@@ -140,8 +160,9 @@ WhatsCLI never rewrites an existing configuration file silently.
 - `src/qr.rs`: terminal QR rendering
 
 The Ratatui loop only handles input, visual state and drawing. A Tokio supervisor owns the protocol,
-session, per-conversation, history, transfer and system-integration workers. All queues are bounded;
-the UI submits work without waiting and reports saturation immediately. The in-memory database is
+session, per-conversation, history, transfer and system-integration workers. User-initiated work
+stays on bounded queues whose saturation is reported immediately, while the ordered protocol event
+queue does not discard connection, message or history events during bursts. The in-memory database is
 owned exclusively by a storage actor, which coalesces consistent conversation/message snapshots
 before sending them to the UI. Synchronous clipboard, opener, notification and preview APIs run in
 Tokio's blocking pool.

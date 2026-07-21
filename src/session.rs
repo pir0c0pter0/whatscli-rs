@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{TimeZone, Utc};
@@ -13,7 +13,7 @@ use whatsapp_rust::download::MediaType;
 use whatsapp_rust::proto_helpers::MessageExt;
 use whatsapp_rust::store::SqliteStore;
 use whatsapp_rust::transport::{TokioWebSocketTransportFactory, UreqHttpClient};
-use whatsapp_rust::types::events::Event;
+use whatsapp_rust::types::events::{Event, EventHandler, LazyHistorySync};
 use whatsapp_rust::types::message::{
     EditAttribute, MessageCategory, MessageInfo, MessageSource, MsgMetaInfo,
 };
@@ -33,6 +33,20 @@ use crate::qr;
 use crate::storage::{QUEUE_CAPACITY, StorageHandle, start_storage_actor};
 
 const TRANSFER_LIMIT: usize = 2;
+
+fn http_client_without_idle_pool() -> UreqHttpClient {
+    UreqHttpClient::with_agent(http_agent_without_idle_pool())
+}
+
+fn http_agent_without_idle_pool() -> ureq::Agent {
+    ureq::config::Config::builder()
+        .input_buffer_size(16 * 1024)
+        .output_buffer_size(16 * 1024)
+        .max_idle_connections(0)
+        .max_idle_connections_per_host(0)
+        .build()
+        .into()
+}
 
 pub struct BackgroundRuntime {
     pub commands: mpsc::Sender<Command>,
@@ -98,7 +112,34 @@ enum IntegrationWork {
 
 enum HistoryWork {
     Command(Command),
-    Protocol(Arc<Event>),
+    Protocol {
+        event: Arc<Event>,
+        queued_at: Instant,
+    },
+}
+
+struct ProtocolEvent {
+    event: Arc<Event>,
+    queued_at: Instant,
+}
+
+struct OrderedEventHandler {
+    tx: async_channel::Sender<ProtocolEvent>,
+}
+
+impl EventHandler for OrderedEventHandler {
+    fn handle_event(&self, event: Arc<Event>) {
+        let kind = event_kind(&event);
+        let envelope = ProtocolEvent {
+            event,
+            queued_at: Instant::now(),
+        };
+        if self.tx.try_send(envelope).is_ok() {
+            log::debug!("protocol event queued type={kind} depth={}", self.tx.len());
+        } else {
+            log::debug!("protocol event ignored after queue close type={kind}");
+        }
+    }
 }
 
 impl SessionManager {
@@ -119,8 +160,7 @@ impl SessionManager {
 
     async fn initialize(
         config: Arc<Config>,
-        protocol_tx: mpsc::Sender<Arc<Event>>,
-        ui_tx: mpsc::Sender<UiEvent>,
+        protocol_tx: async_channel::Sender<ProtocolEvent>,
     ) -> Result<(Arc<Client>, BotHandle)> {
         finish_pending_session_reset(&config.session_file).await?;
         let session_path = config.session_file.to_string_lossy();
@@ -130,26 +170,15 @@ impl SessionManager {
                 config.session_file.display()
             )
         })?);
-        let event_tx = ui_tx.clone();
         let mut bot = Bot::builder()
             .with_backend(store)
             .with_transport_factory(TokioWebSocketTransportFactory::new())
-            .with_http_client(UreqHttpClient::new())
+            .with_http_client(http_client_without_idle_pool())
             .with_runtime(TokioRuntime)
-            .on_event(move |event, _client| {
-                let tx = event_tx.clone();
-                let protocol = protocol_tx.clone();
-                async move {
-                    if protocol.try_send(event).is_err() {
-                        let _ = tx
-                            .send(UiEvent::QueueSaturated(TaskCategory::Session))
-                            .await;
-                    }
-                }
-            })
             .build()
             .await?;
         let client = bot.client();
+        client.register_handler(Arc::new(OrderedEventHandler { tx: protocol_tx }));
         let handle = bot.run().await?;
         Ok((client, handle))
     }
@@ -305,10 +334,7 @@ impl SessionManager {
             from_me: true,
             text: text.into(),
             kind: MessageKind::Text,
-            raw_message: Some(Arc::new(wa::Message {
-                conversation: Some(text.into()),
-                ..Default::default()
-            })),
+            raw_message: None,
             ..Default::default()
         };
         self.storage.add_message(msg, false).await?;
@@ -722,7 +748,7 @@ async fn supervise(
         }))
         .await;
     let (storage, storage_task) = start_storage_actor(ui_tx.clone());
-    let (protocol_tx, protocol_rx) = mpsc::channel(QUEUE_CAPACITY);
+    let (protocol_tx, protocol_rx) = async_channel::unbounded();
     let initialize_task = TaskInfo {
         id: Command::new("initialize", Vec::new()).id,
         category: TaskCategory::Session,
@@ -731,8 +757,7 @@ async fn supervise(
     let _ = ui_tx
         .send(UiEvent::TaskStarted(initialize_task.clone()))
         .await;
-    let initialization =
-        SessionManager::initialize(Arc::clone(&config), protocol_tx, ui_tx.clone());
+    let initialization = SessionManager::initialize(Arc::clone(&config), protocol_tx);
     let (client, connection_task) = tokio::select! {
         _ = shutdown_rx.changed() => {
             storage_task.abort();
@@ -746,6 +771,7 @@ async fn supervise(
                 value
             }
             Err(error) => {
+                log::error!("WhatsApp initialization failed");
                 let _ = ui_tx
                     .send(UiEvent::TaskFailed {
                         task: initialize_task,
@@ -780,7 +806,7 @@ async fn supervise(
 async fn run_workers(
     context: SessionManager,
     command_rx: mpsc::Receiver<Command>,
-    protocol_rx: mpsc::Receiver<Arc<Event>>,
+    protocol_rx: async_channel::Receiver<ProtocolEvent>,
     connection_task: BotHandle,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
@@ -820,6 +846,7 @@ async fn connection_monitor(ui_tx: mpsc::Sender<UiEvent>, task: BotHandle) {
     match task.await {
         Ok(()) => {}
         Err(error) => {
+            log::error!("WhatsApp connection task stopped");
             let _ = ui_tx
                 .send(UiEvent::Error(format!(
                     "WhatsApp connection task stopped: {error}"
@@ -875,6 +902,7 @@ async fn command_router(
             }
         };
         if saturated {
+            log::warn!("command queue saturated category={}", category.label());
             let _ = context.ui_tx.send(UiEvent::QueueSaturated(category)).await;
         }
     }
@@ -956,40 +984,150 @@ async fn execute_task(context: &SessionManager, command: Command) {
 
 async fn finish_task(ui_tx: &mpsc::Sender<UiEvent>, task: TaskInfo, result: Result<()>) {
     let event = match result {
-        Ok(()) => UiEvent::TaskCompleted(task),
-        Err(error) => UiEvent::TaskFailed {
-            task,
-            error: error.to_string(),
-        },
+        Ok(()) => {
+            log::info!("task completed category={}", task.category.label());
+            UiEvent::TaskCompleted(task)
+        }
+        Err(error) => {
+            log::error!("task failed category={}", task.category.label());
+            UiEvent::TaskFailed {
+                task,
+                error: error.to_string(),
+            }
+        }
     };
     let _ = ui_tx.send(event).await;
 }
 
+fn optional_u32(value: Option<u32>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".into())
+}
+
+fn event_kind(event: &Event) -> &'static str {
+    match event {
+        Event::Connected(_) => "connected",
+        Event::Disconnected(_) => "disconnected",
+        Event::PairSuccess(_) => "pair_success",
+        Event::PairError(_) => "pair_error",
+        Event::LoggedOut(_) => "logged_out",
+        Event::PairingQrCode { .. } => "pairing_qr_code",
+        Event::PairingCode { .. } => "pairing_code",
+        Event::QrScannedWithoutMultidevice(_) => "qr_scanned_without_multidevice",
+        Event::ClientOutdated(_) => "client_outdated",
+        Event::Message(_, _) => "message",
+        Event::Receipt(_) => "receipt",
+        Event::UndecryptableMessage(_) => "undecryptable_message",
+        Event::Notification(_) => "notification",
+        Event::ChatPresence(_) => "chat_presence",
+        Event::Presence(_) => "presence",
+        Event::PictureUpdate(_) => "picture_update",
+        Event::UserAboutUpdate(_) => "user_about_update",
+        Event::ContactUpdated(_) => "contact_updated",
+        Event::ContactNumberChanged(_) => "contact_number_changed",
+        Event::ContactSyncRequested(_) => "contact_sync_requested",
+        Event::GroupUpdate(_) => "group_update",
+        Event::ContactUpdate(_) => "contact_update",
+        Event::IncomingCall(_) => "incoming_call",
+        Event::PushNameUpdate(_) => "push_name_update",
+        Event::SelfPushNameUpdated(_) => "self_push_name_updated",
+        Event::PinUpdate(_) => "pin_update",
+        Event::MuteUpdate(_) => "mute_update",
+        Event::ArchiveUpdate(_) => "archive_update",
+        Event::StarUpdate(_) => "star_update",
+        Event::MarkChatAsReadUpdate(_) => "mark_chat_as_read_update",
+        Event::DeleteChatUpdate(_) => "delete_chat_update",
+        Event::DeleteMessageForMeUpdate(_) => "delete_message_for_me_update",
+        Event::HistorySync(_) => "history_sync",
+        Event::OfflineSyncPreview(_) => "offline_sync_preview",
+        Event::OfflineSyncCompleted(_) => "offline_sync_completed",
+        Event::DeviceListUpdate(_) => "device_list_update",
+        Event::IdentityChange(_) => "identity_change",
+        Event::BusinessStatusUpdate(_) => "business_status_update",
+        Event::StreamReplaced(_) => "stream_replaced",
+        Event::TemporaryBan(_) => "temporary_ban",
+        Event::ConnectFailure(_) => "connect_failure",
+        Event::StreamError(_) => "stream_error",
+        Event::DisappearingModeChanged(_) => "disappearing_mode_changed",
+        Event::NewsletterLiveUpdate(_) => "newsletter_live_update",
+        Event::RawNode(_) => "raw_node",
+        Event::MexNotification(_) => "mex_notification",
+        _ => "unknown",
+    }
+}
+
 async fn protocol_worker(
     context: SessionManager,
-    mut rx: mpsc::Receiver<Arc<Event>>,
+    rx: async_channel::Receiver<ProtocolEvent>,
     history_tx: mpsc::Sender<HistoryWork>,
     integration_tx: mpsc::Sender<IntegrationWork>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
+    let mut connection_state = ConnectionEventState::new();
     loop {
-        let event = tokio::select! {
+        let envelope = tokio::select! {
             event = rx.recv() => event,
             _ = shutdown_rx.changed() => break,
         };
-        let Some(event) = event else { break };
+        let Ok(envelope) = envelope else { break };
+        let ProtocolEvent { event, queued_at } = envelope;
+        log::debug!(
+            "protocol event processing type={} queue_wait_ms={} depth={}",
+            event_kind(&event),
+            queued_at.elapsed().as_millis(),
+            rx.len()
+        );
         if matches!(&*event, Event::HistorySync(_)) {
-            if history_tx.try_send(HistoryWork::Protocol(event)).is_err() {
-                let _ = context
-                    .ui_tx
-                    .send(UiEvent::QueueSaturated(TaskCategory::History))
-                    .await;
+            let work = HistoryWork::Protocol {
+                event,
+                queued_at: Instant::now(),
+            };
+            let send = history_tx.send(work);
+            tokio::select! {
+                result = send => {
+                    if result.is_err() {
+                        break;
+                    }
+                    log::debug!(
+                        "history event queued depth={}",
+                        history_tx.max_capacity() - history_tx.capacity()
+                    );
+                }
+                _ = shutdown_rx.changed() => break,
             }
             continue;
         }
-        if let Err(error) = handle_event(event, &context, &integration_tx).await {
+        if let Err(error) =
+            handle_event(event, &context, &integration_tx, &mut connection_state).await
+        {
+            log::error!("protocol event failed");
             let _ = context.ui_tx.send(UiEvent::Error(error.to_string())).await;
         }
+    }
+}
+
+struct ConnectionEventState {
+    pairing_allowed: bool,
+}
+
+impl ConnectionEventState {
+    fn new() -> Self {
+        Self {
+            pairing_allowed: true,
+        }
+    }
+
+    fn paired_or_connected(&mut self) {
+        self.pairing_allowed = false;
+    }
+
+    fn disconnected(&mut self) {
+        self.pairing_allowed = true;
+    }
+
+    fn accepts_pairing(&self) -> bool {
+        self.pairing_allowed
     }
 }
 
@@ -997,10 +1135,11 @@ async fn history_worker(context: SessionManager, mut rx: mpsc::Receiver<HistoryW
     while let Some(work) = rx.recv().await {
         match work {
             HistoryWork::Command(command) => execute_task(&context, command).await,
-            HistoryWork::Protocol(event) => {
+            HistoryWork::Protocol { event, queued_at } => {
                 let Event::HistorySync(lazy) = &*event else {
                     continue;
                 };
+                let started_at = Instant::now();
                 let command = Command::new("history-sync", Vec::new());
                 let task = TaskInfo {
                     id: command.id,
@@ -1008,25 +1147,67 @@ async fn history_worker(context: SessionManager, mut rx: mpsc::Receiver<HistoryW
                     label: "syncing history".into(),
                 };
                 let _ = context.ui_tx.send(UiEvent::TaskStarted(task.clone())).await;
-                let result = if let Some(history) = lazy.get() {
-                    handle_history(history, &context.client, &context.storage).await
-                } else {
-                    Ok(())
+                log::info!(
+                    "history sync started type={} order={} progress={} queue_wait_ms={}",
+                    lazy.sync_type(),
+                    optional_u32(lazy.chunk_order()),
+                    optional_u32(lazy.progress()),
+                    queued_at.elapsed().as_millis()
+                );
+                let result = match decode_history_sync(lazy) {
+                    Ok(history) => {
+                        let limit = history_limit(
+                            lazy.sync_type(),
+                            context.config.general.history_sync_limit,
+                        );
+                        handle_history(history, &context.client, &context.storage, limit).await
+                    }
+                    Err(error) => Err(error),
                 };
+                match &result {
+                    Ok(()) => log::info!(
+                        "history sync completed type={} duration_ms={}",
+                        lazy.sync_type(),
+                        started_at.elapsed().as_millis()
+                    ),
+                    Err(error) => log::error!(
+                        "history sync failed type={} duration_ms={} error={}",
+                        lazy.sync_type(),
+                        started_at.elapsed().as_millis(),
+                        crate::logging::redact(&error.to_string())
+                    ),
+                }
                 finish_task(&context.ui_tx, task, result).await;
             }
         }
     }
 }
 
+fn decode_history_sync(lazy: &LazyHistorySync) -> Result<&wa::HistorySync> {
+    lazy.get().ok_or_else(|| {
+        anyhow!(
+            "history sync decode failed (type={}, order={}, progress={})",
+            lazy.sync_type(),
+            optional_u32(lazy.chunk_order()),
+            optional_u32(lazy.progress())
+        )
+    })
+}
+
 async fn handle_event(
     event: Arc<Event>,
     context: &SessionManager,
     integration_tx: &mpsc::Sender<IntegrationWork>,
+    connection_state: &mut ConnectionEventState,
 ) -> Result<()> {
     let tx = &context.ui_tx;
     match &*event {
         Event::PairingQrCode { code, timeout } => {
+            if !connection_state.accepts_pairing() {
+                log::warn!("stale pairing QR ignored after connected or paired state");
+                return Ok(());
+            }
+            log::info!("connection state=pairing");
             let rendered = qr::render(code)?;
             let _ = tx
                 .send(UiEvent::Status(SessionStatus {
@@ -1041,7 +1222,20 @@ async fn handle_event(
                 })
                 .await;
         }
+        Event::PairSuccess(_) => {
+            connection_state.paired_or_connected();
+            log::info!("connection state=connecting reason=pair_success");
+            let _ = tx.send(UiEvent::ClearQr).await;
+            let _ = tx
+                .send(UiEvent::Status(SessionStatus {
+                    state: ConnectionState::Connecting,
+                    last_seen: String::new(),
+                }))
+                .await;
+        }
         Event::Connected(_) => {
+            connection_state.paired_or_connected();
+            log::info!("connection state=connected");
             let _ = tx
                 .send(UiEvent::Status(SessionStatus {
                     state: ConnectionState::Connected,
@@ -1051,9 +1245,13 @@ async fn handle_event(
             load_groups(&context.client, &context.storage).await?;
         }
         Event::Disconnected(_) => {
+            connection_state.disconnected();
+            log::info!("connection state=disconnected");
             let _ = tx.send(UiEvent::Status(SessionStatus::default())).await;
         }
         Event::LoggedOut(info) => {
+            connection_state.disconnected();
+            log::info!("connection state=disconnected reason=logged_out");
             let _ = tx.send(UiEvent::Status(SessionStatus::default())).await;
             let _ = tx
                 .send(UiEvent::Text(format!("Logged out: {:?}", info.reason)))
@@ -1129,7 +1327,11 @@ async fn handle_history(
     history: &wa::HistorySync,
     client: &Arc<Client>,
     storage: &StorageHandle,
+    message_limit: usize,
 ) -> Result<()> {
+    let mut processed_messages = 0_usize;
+    let mut stored_messages = 0_usize;
+    let mut limited_messages = 0_usize;
     let mut names = HashMap::new();
     for push in &history.pushnames {
         if let (Some(id), Some(name)) = (&push.id, &push.pushname)
@@ -1181,7 +1383,12 @@ async fn handle_history(
                 ..Default::default()
             })
             .await?;
-        for historical in &conversation.messages {
+        let selected_messages = history_messages(conversation, message_limit);
+        limited_messages += conversation
+            .messages
+            .len()
+            .saturating_sub(selected_messages.len());
+        for historical in selected_messages {
             let Some(web) = &historical.message else {
                 continue;
             };
@@ -1189,15 +1396,51 @@ async fn handle_history(
             let Some(info) = history_message_info(web, &chat_jid, client).await else {
                 continue;
             };
+            processed_messages += 1;
             if let Some(message) = message_from_info(&info, Arc::new(raw.clone()), storage).await {
-                storage.add_historical_message(message, false).await?;
+                stored_messages +=
+                    usize::from(storage.add_historical_message(message, false).await?);
             }
         }
         storage
             .update_chat_unread(chat_id, conversation.unread_count.unwrap_or(0) as usize)
             .await?;
     }
+    log::info!(
+        "history sync applied conversations={} processed={} stored={} limited={}",
+        history.conversations.len(),
+        processed_messages,
+        stored_messages,
+        limited_messages
+    );
     Ok(())
+}
+
+fn history_limit(sync_type: i32, configured_limit: usize) -> usize {
+    if sync_type == wa::history_sync::HistorySyncType::OnDemand as i32 {
+        0
+    } else {
+        configured_limit
+    }
+}
+
+fn history_messages(conversation: &wa::Conversation, limit: usize) -> Vec<&wa::HistorySyncMsg> {
+    let mut messages = conversation.messages.iter().collect::<Vec<_>>();
+    if limit == 0 || messages.len() <= limit {
+        return messages;
+    }
+    messages.sort_by_key(|historical| {
+        (
+            historical
+                .message
+                .as_ref()
+                .and_then(|message| message.message_timestamp)
+                .unwrap_or_default(),
+            historical.msg_order_id.unwrap_or_default(),
+        )
+    });
+    messages.drain(..messages.len() - limit);
+    messages
 }
 
 async fn history_message_info(
@@ -1278,7 +1521,7 @@ async fn message_from_info(
         timestamp: info.timestamp.timestamp().max(0) as u64,
         from_me: info.source.is_from_me,
         forwarded: is_forwarded(base),
-        raw_message: Some(raw.clone()),
+        raw_message: None,
         ..Default::default()
     };
     if let Some(text) = raw.text_content() {
@@ -1286,18 +1529,22 @@ async fn message_from_info(
         msg.text = text.into();
     } else if let Some(media) = &base.image_message {
         msg.kind = MessageKind::Image;
+        msg.raw_message = Some(Arc::clone(&raw));
         msg.mime_type = media.mimetype.clone().unwrap_or_default();
         msg.text = media_display_text(msg.kind, "", media.caption.as_deref().unwrap_or(""));
     } else if let Some(media) = &base.video_message {
         msg.kind = MessageKind::Video;
+        msg.raw_message = Some(Arc::clone(&raw));
         msg.mime_type = media.mimetype.clone().unwrap_or_default();
         msg.text = media_display_text(msg.kind, "", media.caption.as_deref().unwrap_or(""));
     } else if let Some(media) = &base.audio_message {
         msg.kind = MessageKind::Audio;
+        msg.raw_message = Some(Arc::clone(&raw));
         msg.mime_type = media.mimetype.clone().unwrap_or_default();
         msg.text = media_display_text(msg.kind, "", "");
     } else if let Some(media) = &base.document_message {
         msg.kind = MessageKind::Document;
+        msg.raw_message = Some(Arc::clone(&raw));
         msg.mime_type = media.mimetype.clone().unwrap_or_default();
         msg.file_name = media.file_name.clone().unwrap_or_default();
         msg.text = media_display_text(
@@ -1684,6 +1931,206 @@ mod tests {
         }
         while jobs.join_next().await.is_some() {}
         assert_eq!(maximum.load(Ordering::SeqCst), TRANSFER_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn protocol_handler_keeps_fifo_order_beyond_the_old_capacity() {
+        let (tx, rx) = async_channel::unbounded();
+        let handler = OrderedEventHandler { tx };
+        for index in 0..256 {
+            handler.handle_event(Arc::new(Event::PairingQrCode {
+                code: index.to_string(),
+                timeout: Duration::from_secs(30),
+            }));
+        }
+        handler.handle_event(Arc::new(Event::Connected(
+            whatsapp_rust::types::events::Connected,
+        )));
+
+        for expected in 0..256 {
+            let envelope = rx.recv().await.unwrap();
+            let Event::PairingQrCode { code, .. } = &*envelope.event else {
+                panic!("event order changed");
+            };
+            assert_eq!(code, &expected.to_string());
+        }
+        assert!(matches!(
+            &*rx.recv().await.unwrap().event,
+            Event::Connected(_)
+        ));
+    }
+
+    #[test]
+    fn event_log_metadata_omits_qr_message_and_payload_contents() {
+        let secrets = [
+            "private-qr-code",
+            "private message text",
+            "5511999999999@s.whatsapp.net",
+            "https://mmg.whatsapp.net/private-media",
+            "raw-payload",
+        ];
+        let qr = Event::PairingQrCode {
+            code: secrets[0].into(),
+            timeout: Duration::from_secs(30),
+        };
+        let message = Event::Message(
+            Arc::new(wa::Message {
+                conversation: Some(secrets[1..].join(" ")),
+                ..Default::default()
+            }),
+            Arc::new(MessageInfo::default()),
+        );
+        let line = format!(
+            "protocol event type={} next_type={}",
+            event_kind(&qr),
+            event_kind(&message)
+        );
+        for secret in secrets {
+            assert!(!line.contains(secret));
+        }
+    }
+
+    #[test]
+    fn pairing_requires_a_disconnect_after_connected_or_pair_success() {
+        let mut state = ConnectionEventState::new();
+        assert!(state.accepts_pairing());
+        state.paired_or_connected();
+        assert!(!state.accepts_pairing());
+        state.disconnected();
+        assert!(state.accepts_pairing());
+    }
+
+    #[test]
+    fn automatic_history_keeps_only_the_most_recent_messages() {
+        let mut conversation = wa::Conversation {
+            id: "chat".into(),
+            ..Default::default()
+        };
+        for timestamp in (0..500_u64).rev() {
+            conversation.messages.push(wa::HistorySyncMsg {
+                message: Some(wa::WebMessageInfo {
+                    message_timestamp: Some(timestamp),
+                    ..Default::default()
+                }),
+                msg_order_id: Some(timestamp),
+            });
+        }
+        let selected = history_messages(&conversation, 200);
+        assert_eq!(selected.len(), 200);
+        assert_eq!(
+            selected
+                .first()
+                .unwrap()
+                .message
+                .as_ref()
+                .unwrap()
+                .message_timestamp,
+            Some(300)
+        );
+        assert_eq!(
+            selected
+                .last()
+                .unwrap()
+                .message
+                .as_ref()
+                .unwrap()
+                .message_timestamp,
+            Some(499)
+        );
+    }
+
+    #[test]
+    fn on_demand_history_is_not_limited() {
+        assert_eq!(
+            history_limit(wa::history_sync::HistorySyncType::Recent as i32, 200),
+            200
+        );
+        assert_eq!(
+            history_limit(wa::history_sync::HistorySyncType::OnDemand as i32, 200),
+            0
+        );
+    }
+
+    #[test]
+    fn history_decode_failure_contains_only_batch_metadata() {
+        let lazy = LazyHistorySync::new(vec![0xff].into(), 3, Some(7), Some(42));
+        let error = decode_history_sync(&lazy).unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "history sync decode failed (type=3, order=7, progress=42)"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_decode_failure_emits_task_failed() {
+        let lazy = LazyHistorySync::new(vec![0xff].into(), 3, Some(7), Some(42));
+        let error = decode_history_sync(&lazy).unwrap_err();
+        let (ui_tx, mut ui_rx) = mpsc::channel(1);
+        let task = TaskInfo {
+            id: 1,
+            category: TaskCategory::History,
+            label: "syncing history".into(),
+        };
+        finish_task(&ui_tx, task, Err(error)).await;
+        let UiEvent::TaskFailed { error, .. } = ui_rx.recv().await.unwrap() else {
+            panic!("decode failure was reported as success");
+        };
+        assert_eq!(
+            error,
+            "history sync decode failed (type=3, order=7, progress=42)"
+        );
+    }
+
+    #[test]
+    fn http_agent_disables_idle_connection_pool_without_changing_buffers() {
+        let agent = http_agent_without_idle_pool();
+        assert_eq!(agent.config().input_buffer_size(), 16 * 1024);
+        assert_eq!(agent.config().output_buffer_size(), 16 * 1024);
+        assert_eq!(agent.config().max_idle_connections(), 0);
+        assert_eq!(agent.config().max_idle_connections_per_host(), 0);
+    }
+
+    #[tokio::test]
+    async fn text_drops_raw_proto_while_media_retains_it() {
+        let (ui_tx, _ui_rx) = mpsc::channel(QUEUE_CAPACITY);
+        let (storage, storage_task) = start_storage_actor(ui_tx);
+        let chat: Jid = "123@s.whatsapp.net".parse().unwrap();
+        let info = MessageInfo {
+            source: MessageSource {
+                chat: chat.clone(),
+                sender: chat,
+                ..Default::default()
+            },
+            id: "text".into(),
+            timestamp: Utc::now(),
+            ..Default::default()
+        };
+        let text = message_from_info(
+            &info,
+            Arc::new(wa::Message {
+                conversation: Some("private content".into()),
+                ..Default::default()
+            }),
+            &storage,
+        )
+        .await
+        .unwrap();
+        assert!(text.raw_message.is_none());
+
+        let mut media_info = info;
+        media_info.id = "image".into();
+        let image = message_from_info(
+            &media_info,
+            Arc::new(wa::Message {
+                image_message: Some(Box::new(wa::message::ImageMessage::default())),
+                ..Default::default()
+            }),
+            &storage,
+        )
+        .await
+        .unwrap();
+        assert!(image.raw_message.is_some());
+        storage_task.abort();
     }
 
     #[tokio::test]

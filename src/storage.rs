@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Local};
@@ -52,10 +52,19 @@ pub fn start_storage_actor(ui_tx: mpsc::Sender<UiEvent>) -> (StorageHandle, Join
 
 impl StorageHandle {
     async fn send(&self, command: StorageCommand) -> Result<()> {
-        self.tx
+        let started_at = Instant::now();
+        let depth = self.tx.max_capacity() - self.tx.capacity();
+        let result = self
+            .tx
             .send(command)
             .await
-            .map_err(|_| anyhow!("storage worker stopped"))
+            .map_err(|_| anyhow!("storage worker stopped"));
+        log::trace!(
+            "storage queue send depth={} wait_us={}",
+            depth,
+            started_at.elapsed().as_micros()
+        );
+        result
     }
 
     pub async fn select(&self, chat_id: String) -> Result<()> {
@@ -311,7 +320,7 @@ fn apply_storage_command(
 #[derive(Default)]
 pub struct MessageDatabase {
     messages: HashMap<String, Vec<Message>>,
-    messages_by_id: HashMap<String, Message>,
+    message_chat_by_id: HashMap<String, String>,
     chats: HashMap<String, Chat>,
     contacts: HashMap<String, Contact>,
     chat_activity_order: HashMap<String, u64>,
@@ -324,7 +333,13 @@ impl MessageDatabase {
     }
 
     fn store_message(&mut self, mut msg: Message, mark_unread: bool, promote_chat: bool) -> bool {
-        if let Some(existing) = self.messages_by_id.get_mut(&msg.id) {
+        if let Some(chat_id) = self.message_chat_by_id.get(&msg.id).cloned()
+            && let Some(existing) = self
+                .messages
+                .get_mut(&chat_id)
+                .and_then(|messages| messages.iter_mut().find(|stored| stored.id == msg.id))
+        {
+            let newly_unread = mark_unread && !existing.unread;
             if existing.raw_message.is_none() && msg.raw_message.is_some() {
                 existing.raw_message = msg.raw_message.take();
             }
@@ -342,31 +357,23 @@ impl MessageDatabase {
             }
             existing.unread |= mark_unread;
             let merged = existing.clone();
-            self.replace_message(&merged);
-            self.update_chat_from_message(&merged, mark_unread);
+            self.update_chat_from_message(&merged, newly_unread);
             return false;
         }
 
         msg.unread = mark_unread;
-        self.messages_by_id.insert(msg.id.clone(), msg.clone());
-        let messages = self.messages.entry(msg.chat_id.clone()).or_default();
-        messages.push(msg.clone());
-        messages.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
         self.update_chat_from_message(&msg, mark_unread);
         if promote_chat {
             self.next_activity_order = self.next_activity_order.saturating_add(1);
             self.chat_activity_order
                 .insert(msg.chat_id.clone(), self.next_activity_order);
         }
+        self.message_chat_by_id
+            .insert(msg.id.clone(), msg.chat_id.clone());
+        let messages = self.messages.entry(msg.chat_id.clone()).or_default();
+        messages.push(msg);
+        messages.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
         true
-    }
-
-    fn replace_message(&mut self, msg: &Message) {
-        if let Some(messages) = self.messages.get_mut(&msg.chat_id)
-            && let Some(slot) = messages.iter_mut().find(|stored| stored.id == msg.id)
-        {
-            *slot = msg.clone();
-        }
     }
 
     fn update_chat_from_message(&mut self, msg: &Message, mark_unread: bool) {
@@ -434,13 +441,10 @@ impl MessageDatabase {
         if let Some(messages) = self.messages.get_mut(chat_id) {
             for msg in messages {
                 msg.unread = ids.contains(&msg.id);
-                if let Some(stored) = self.messages_by_id.get_mut(&msg.id) {
-                    stored.unread = msg.unread;
-                }
             }
         }
         if let Some(chat) = self.chats.get_mut(chat_id) {
-            chat.unread = ids.len();
+            chat.unread = unread;
         }
     }
 
@@ -451,9 +455,6 @@ impl MessageDatabase {
                 if msg.unread {
                     cleared.push(msg.clone());
                     msg.unread = false;
-                    if let Some(stored) = self.messages_by_id.get_mut(&msg.id) {
-                        stored.unread = false;
-                    }
                 }
             }
         }
@@ -464,14 +465,20 @@ impl MessageDatabase {
     }
 
     pub fn mark_message_revoked(&mut self, id: &str) -> bool {
-        let Some(msg) = self.messages_by_id.get_mut(id) else {
+        let Some(chat_id) = self.message_chat_by_id.get(id).cloned() else {
+            return false;
+        };
+        let Some(msg) = self
+            .messages
+            .get_mut(&chat_id)
+            .and_then(|messages| messages.iter_mut().find(|msg| msg.id == id))
+        else {
             return false;
         };
         msg.text = "[message revoked]".into();
         msg.raw_message = None;
         msg.kind = MessageKind::Unknown;
         let updated = msg.clone();
-        self.replace_message(&updated);
         self.update_chat_from_message(&updated, false);
         true
     }
@@ -540,7 +547,6 @@ impl MessageDatabase {
                     msg.contact_name.clone_from(&contact.name);
                 }
                 msg.contact_short.clone_from(new_name);
-                self.messages_by_id.insert(msg.id.clone(), msg.clone());
             }
         }
         for (id, contact) in changed {
@@ -561,7 +567,6 @@ impl MessageDatabase {
                 };
                 msg.contact_name.clone_from(&contact.name);
                 msg.contact_short.clone_from(&contact.short);
-                self.messages_by_id.insert(msg.id.clone(), msg.clone());
             }
         }
         for (id, chat) in &mut self.chats {
@@ -598,7 +603,11 @@ impl MessageDatabase {
     }
 
     pub fn message(&self, id: &str) -> Option<&Message> {
-        self.messages_by_id.get(id)
+        let chat_id = self.message_chat_by_id.get(id)?;
+        self.messages
+            .get(chat_id)?
+            .iter()
+            .find(|message| message.id == id)
     }
 
     pub fn oldest_message(&self, chat_id: &str) -> Option<&Message> {
@@ -748,6 +757,51 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn server_unread_count_is_preserved_when_local_history_is_limited() {
+        let mut db = MessageDatabase::default();
+        let chat = "group@g.us";
+        for i in 0..200 {
+            db.add_message(message(&i.to_string(), chat, i), false);
+        }
+        db.update_chat_unread(chat, 450);
+        assert_eq!(db.chats()[0].unread, 450);
+        assert_eq!(
+            db.messages(chat)
+                .iter()
+                .filter(|message| message.unread)
+                .count(),
+            200
+        );
+    }
+
+    #[test]
+    fn id_index_points_to_the_single_stored_message_copy() {
+        let mut db = MessageDatabase::default();
+        let chat = "123@s.whatsapp.net";
+        let raw = std::sync::Arc::new(whatsapp_rust::waproto::whatsapp::Message::default());
+        let mut media = message("media", chat, 1);
+        media.kind = MessageKind::Image;
+        media.raw_message = Some(std::sync::Arc::clone(&raw));
+        db.add_message(media, false);
+
+        assert_eq!(
+            db.message_chat_by_id.get("media").map(String::as_str),
+            Some(chat)
+        );
+        assert_eq!(std::sync::Arc::strong_count(&raw), 2);
+        assert!(db.message("media").is_some());
+        assert!(db.message_info("media").contains("Type: image"));
+        db.add_message(message("media", chat, 1), true);
+        db.add_message(message("media", chat, 1), true);
+        assert_eq!(db.messages(chat).len(), 1);
+        assert_eq!(db.chats()[0].unread, 1);
+        assert_eq!(db.mark_chat_read(chat).len(), 1);
+        assert!(db.mark_message_revoked("media"));
+        assert_eq!(db.message("media").unwrap().text, "[message revoked]");
+        assert!(db.message("media").unwrap().raw_message.is_none());
     }
 
     #[test]

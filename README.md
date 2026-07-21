@@ -31,7 +31,7 @@ Ratatui/Crossterm for the interface.
 Install the prebuilt binary with npm (Node.js 18 or newer):
 
 ```bash
-npm install --global whatscli
+npm install --global @pir0c0pter0/whatscli
 ```
 
 Prebuilt npm binaries are available for Linux x64, Raspberry Pi ARM and Windows x64. Audio and

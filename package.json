@@ -1,5 +1,5 @@
 {
-  "name": "whatscli",
+  "name": "@pir0c0pter0/whatscli",
   "version": "1.1.7",
   "description": "Terminal WhatsApp client written in Rust",
   "license": "MIT",

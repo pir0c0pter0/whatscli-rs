@@ -72,6 +72,23 @@ impl Editor {
         self.cursor = self.text.len();
     }
 
+    pub fn set_cursor_column(&mut self, column: usize, width: usize) {
+        let (_, visible_cursor) = self.viewport(width);
+        let cursor_prefix_width = UnicodeWidthStr::width(&self.text[..self.cursor]);
+        let viewport_start = cursor_prefix_width.saturating_sub(visible_cursor as usize);
+        let target = viewport_start.saturating_add(column);
+        let mut used = 0;
+        self.cursor = self.text.len();
+        for (index, grapheme) in self.text.grapheme_indices(true) {
+            let next = used + UnicodeWidthStr::width(grapheme);
+            if target < next {
+                self.cursor = index;
+                break;
+            }
+            used = next;
+        }
+    }
+
     pub fn backspace(&mut self) {
         let end = self.cursor;
         self.move_left();
@@ -191,5 +208,13 @@ mod tests {
         let (visible, cursor) = editor.viewport(10);
         assert!(UnicodeWidthStr::width(visible.as_str()) <= 10);
         assert!(cursor < 10);
+    }
+
+    #[test]
+    fn mouse_column_positions_cursor_on_grapheme_boundary() {
+        let mut editor = Editor::new("aé👩🏽‍💻z");
+        editor.set_cursor_column(1, 20);
+        editor.insert('X');
+        assert_eq!(editor.text(), "aXé👩🏽‍💻z");
     }
 }

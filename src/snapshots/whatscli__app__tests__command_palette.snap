@@ -1,6 +1,6 @@
 ---
 source: src/app.rs
-expression: "render(&app, 100, 28)"
+expression: "render(&mut app, 100, 28)"
 ---
  WhatsCLI v1.1.5  Maria Oliveira ● online
   conversations / thread / composer
@@ -15,8 +15,8 @@ expression: "render(&app, 100, 28)"
             │   /sendimage   Media     Send an image                                   │
             │   /sendvideo   Media     Send a video                                    │
             │   /upload      Media     Send a document                                 │
-            │                                                                          │
-            │                                                                          │
+            │   /download    Media     Save a media message to the downloads folder  d │
+            │   /view        Media     View an image or WebP sticker inside the TUI  E │
             │                                                                          │
             │                                                                          │
             │                                                                          │

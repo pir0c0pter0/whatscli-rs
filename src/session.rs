@@ -228,6 +228,7 @@ impl SessionManager {
             "download" => self.download_command(&command, false, false).await?,
             "open" => self.download_command(&command, true, false).await?,
             "show" => self.download_command(&command, true, true).await?,
+            "view" | "play" => self.media_command(&command).await?,
             "url" => self.open_url(&command).await?,
             "upload" => {
                 self.send_media_command(&command, MessageKind::Document)
@@ -425,22 +426,42 @@ impl SessionManager {
     }
 
     async fn download_message(&self, msg: &Message, preview: bool) -> Result<PathBuf> {
+        let file_name = download_file_name(msg);
+        if preview {
+            let path = crate::media_cache::cache_path(
+                &self.config.general.preview_path,
+                &msg.id,
+                &file_name,
+            )
+            .await?;
+            if tokio::fs::try_exists(&path).await? {
+                crate::media_cache::touch(&path).await?;
+                return Ok(path);
+            }
+        } else {
+            let cached = crate::media_cache::cache_path(
+                &self.config.general.media_cache_path,
+                &msg.id,
+                &file_name,
+            )
+            .await?;
+            if tokio::fs::try_exists(&cached).await? {
+                crate::media_cache::touch(&cached).await?;
+                let data = tokio::fs::read(cached).await?;
+                return crate::media_cache::atomic_write_download(
+                    &self.config.general.download_path,
+                    &file_name,
+                    &data,
+                )
+                .await;
+            }
+        }
         ensure_connected(&self.client)?;
         let raw = msg
             .raw_message
             .as_ref()
             .ok_or_else(|| anyhow!("This is not a downloadable message"))?;
         let base = raw.get_base_message();
-        let base_dir = if preview {
-            &self.config.general.preview_path
-        } else {
-            &self.config.general.download_path
-        };
-        tokio::fs::create_dir_all(base_dir).await?;
-        let path = base_dir.join(download_file_name(msg));
-        if tokio::fs::try_exists(&path).await? {
-            return Ok(path);
-        }
         let data = match msg.kind {
             MessageKind::Image => {
                 self.client
@@ -478,10 +499,119 @@ impl SessionManager {
                     )
                     .await?
             }
+            MessageKind::Sticker => {
+                let sticker = base
+                    .sticker_message
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("missing sticker payload"))?;
+                ensure_supported_sticker(sticker)?;
+                self.client.download(sticker).await?
+            }
             _ => bail!("This is not a downloadable message"),
         };
-        tokio::fs::write(&path, data).await?;
-        Ok(path)
+        if preview {
+            let path = crate::media_cache::cache_path(
+                &self.config.general.preview_path,
+                &msg.id,
+                &file_name,
+            )
+            .await?;
+            crate::media_cache::atomic_write_cached(&path, &data).await
+        } else {
+            crate::media_cache::atomic_write_download(
+                &self.config.general.download_path,
+                &file_name,
+                &data,
+            )
+            .await
+        }
+    }
+
+    async fn media_command(&self, command: &Command) -> Result<()> {
+        let id = require_param(command, 0)?;
+        let msg = self
+            .storage
+            .message(id.to_owned())
+            .await?
+            .ok_or_else(|| anyhow!("message not found"))?;
+        let valid = match command.name.as_str() {
+            "view" => matches!(msg.kind, MessageKind::Image | MessageKind::Sticker),
+            "play" => matches!(msg.kind, MessageKind::Audio | MessageKind::Video),
+            _ => false,
+        };
+        if !valid {
+            bail!("{} is not available for this message", command.name);
+        }
+        let file_name = download_file_name(&msg);
+        let path = crate::media_cache::cache_path(
+            &self.config.general.media_cache_path,
+            &msg.id,
+            &file_name,
+        )
+        .await?;
+        let path = if tokio::fs::try_exists(&path).await? {
+            crate::media_cache::touch(&path).await?;
+            path
+        } else {
+            ensure_connected(&self.client)?;
+            let raw = msg
+                .raw_message
+                .as_ref()
+                .ok_or_else(|| anyhow!("This media has no downloadable payload"))?;
+            let base = raw.get_base_message();
+            let data = match msg.kind {
+                MessageKind::Image => {
+                    self.client
+                        .download(
+                            base.image_message
+                                .as_deref()
+                                .ok_or_else(|| anyhow!("missing image payload"))?,
+                        )
+                        .await?
+                }
+                MessageKind::Video => {
+                    self.client
+                        .download(
+                            base.video_message
+                                .as_deref()
+                                .ok_or_else(|| anyhow!("missing video payload"))?,
+                        )
+                        .await?
+                }
+                MessageKind::Audio => {
+                    self.client
+                        .download(
+                            base.audio_message
+                                .as_deref()
+                                .ok_or_else(|| anyhow!("missing audio payload"))?,
+                        )
+                        .await?
+                }
+                MessageKind::Sticker => {
+                    let sticker = base
+                        .sticker_message
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("missing sticker payload"))?;
+                    ensure_supported_sticker(sticker)?;
+                    self.client.download(sticker).await?
+                }
+                _ => bail!("This is not playable media"),
+            };
+            crate::media_cache::atomic_write_cached(&path, &data).await?
+        };
+        let _ = self
+            .ui_tx
+            .send(UiEvent::MediaReady {
+                path,
+                kind: msg.kind,
+                title: if msg.file_name.is_empty() {
+                    msg.kind.to_string()
+                } else {
+                    msg.file_name
+                },
+            })
+            .await;
+        Ok(())
     }
 
     async fn open_url(&self, command: &Command) -> Result<()> {
@@ -1586,6 +1716,15 @@ async fn message_from_info(
             &msg.file_name,
             media.caption.as_deref().unwrap_or(""),
         );
+    } else if let Some(media) = &base.sticker_message {
+        msg.kind = MessageKind::Sticker;
+        msg.raw_message = Some(Arc::clone(&raw));
+        msg.mime_type = media
+            .mimetype
+            .clone()
+            .unwrap_or_else(|| "image/webp".into());
+        msg.file_name = format!("{}.webp", msg.id);
+        msg.text = media_display_text(msg.kind, "", "");
     } else {
         return None;
     }
@@ -1622,6 +1761,11 @@ fn is_forwarded(message: &wa::Message) -> bool {
         })
         .or_else(|| {
             base.document_message
+                .as_deref()
+                .and_then(|m| m.context_info.as_deref())
+        })
+        .or_else(|| {
+            base.sticker_message
                 .as_deref()
                 .and_then(|m| m.context_info.as_deref())
         })
@@ -1730,6 +1874,7 @@ fn media_display_text(kind: MessageKind, file_name: &str, caption: &str) -> Stri
         MessageKind::Video => "[VIDEO]",
         MessageKind::Audio => "[AUDIO]",
         MessageKind::Document => "[DOCUMENT]",
+        MessageKind::Sticker => "[STICKER]",
         _ => "[FILE]",
     };
     [
@@ -1755,14 +1900,21 @@ pub fn download_file_name(msg: &Message) -> String {
             && name != "."
             && name != ".."
         {
-            return name.into();
+            return crate::media_cache::safe_file_name(name, &msg.id);
         }
     }
     let extension = mime_guess::get_mime_extensions_str(&msg.mime_type)
         .and_then(|all| all.first())
         .map(|ext| format!(".{ext}"))
         .unwrap_or_default();
-    format!("{}{extension}", msg.id)
+    crate::media_cache::safe_file_name(&format!("{}{extension}", msg.id), "media")
+}
+
+fn ensure_supported_sticker(sticker: &wa::message::StickerMessage) -> Result<()> {
+    if sticker.is_lottie.unwrap_or(false) {
+        bail!("Lottie stickers are not supported yet; WebP stickers can be viewed")
+    }
+    Ok(())
 }
 
 fn require_param(command: &Command, index: usize) -> Result<&str> {
@@ -2035,6 +2187,17 @@ mod tests {
     }
 
     #[test]
+    fn lottie_stickers_have_an_actionable_error() {
+        let sticker = wa::message::StickerMessage {
+            is_lottie: Some(true),
+            ..Default::default()
+        };
+        let error = ensure_supported_sticker(&sticker).unwrap_err().to_string();
+        assert!(error.contains("Lottie"));
+        assert!(error.contains("WebP"));
+    }
+
+    #[test]
     fn automatic_history_keeps_only_the_most_recent_messages() {
         let mut conversation = wa::Conversation {
             id: "chat".into(),
@@ -2164,6 +2327,26 @@ mod tests {
         .await
         .unwrap();
         assert!(image.raw_message.is_some());
+
+        let mut sticker_info = media_info;
+        sticker_info.id = "sticker".into();
+        let sticker = message_from_info(
+            &sticker_info,
+            Arc::new(wa::Message {
+                sticker_message: Some(Box::new(wa::message::StickerMessage {
+                    mimetype: Some("image/webp".into()),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }),
+            &storage,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sticker.kind, MessageKind::Sticker);
+        assert_eq!(sticker.mime_type, "image/webp");
+        assert_eq!(sticker.file_name, "sticker.webp");
+        assert!(sticker.raw_message.is_some());
         storage.close().await.unwrap();
         storage_task.await.unwrap();
     }

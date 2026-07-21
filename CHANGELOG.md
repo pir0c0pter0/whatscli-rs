@@ -6,6 +6,19 @@ All notable changes to WhatsCLI RS are documented in this file.
 
 ### Added
 
+- Mouse navigation for conversations, variable-height messages, the composer, palette/search,
+  confirmations and media controls, with terminal mouse mode restored on exit.
+- An in-terminal photo and animated/static WebP sticker viewer using Kitty, Sixel, iTerm2 or a
+  universal half-block fallback, plus an FFmpeg/Rodio audio and video player with play/pause, seek,
+  progress, volume and mute controls.
+- Internal `view` and `play` commands and primary `Enter` actions on media bubbles; documents now
+  display an explicit download action while the legacy `open` and `show` commands remain available.
+- A separate XDG media cache with configurable 30-day retention and 1 GiB default limit, and atomic
+  collision-safe explicit downloads that never overwrite an existing file.
+- Persisted `Sticker` message kind value `6`, including live/history hydration and WebP download.
+- `mouse_enabled`, `media_cache_path`, `media_cache_retention_days`, `media_cache_max_mb` and
+  `message_activate` configuration values with backwards-compatible defaults.
+
 - A versioned SQLite conversation cache at `~/.config/whatscli/cache.db` that restores contacts,
   conversation ordering, previews, unread counters, recent messages and media payloads before the
   network history sync completes.
@@ -34,7 +47,7 @@ All notable changes to WhatsCLI RS are documented in this file.
 - Limited automatic history sync to the 200 most recent messages per conversation by default;
   `/backlog` `ON_DEMAND` batches remain unlimited and can explicitly extend local history.
 - Replaced the duplicate message-by-ID store with an ID-to-conversation index and retained raw
-  protobuf only for downloadable image, video, audio and document messages.
+  protobuf only for downloadable image, video, audio, document and sticker messages.
 - Disabled the HTTP client's idle connection pool while preserving the existing 16 KiB buffers and
   response-size limit.
 - Moved WhatsApp initialization, session operations, history synchronization, media transfers and

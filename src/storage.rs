@@ -937,9 +937,11 @@ fn message_needs_hydration(message: &Message) -> bool {
     match message.kind {
         MessageKind::Unknown => true,
         MessageKind::Text => false,
-        MessageKind::Image | MessageKind::Video | MessageKind::Audio | MessageKind::Document => {
-            message.raw_message.is_none()
-        }
+        MessageKind::Image
+        | MessageKind::Video
+        | MessageKind::Audio
+        | MessageKind::Document
+        | MessageKind::Sticker => message.raw_message.is_none(),
     }
 }
 

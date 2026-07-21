@@ -2,6 +2,8 @@ pub mod app;
 pub mod cache;
 pub mod config;
 pub mod logging;
+pub mod media;
+pub mod media_cache;
 pub mod model;
 pub mod qr;
 pub mod session;

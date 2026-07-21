@@ -16,10 +16,11 @@ Ratatui/Crossterm for the interface.
 - QR-code login with an encrypted, persistent multi-device session
 - Instant conversation-list restoration from a separate local SQLite cache
 - Live messages and history synchronization for contacts and groups
-- Text, image, video, audio and document send/download support
+- Text, image, video, audio, WebP sticker and document download support
 - Read receipts, unread counters, message info, URL opening and revocation
 - Group creation, leave, subject changes, member add/remove and admin changes
-- Configurable colors, key bindings, desktop notifications and terminal image previews
+- In-terminal photo/sticker viewer and audio/video player with Kitty, Sixel, iTerm2 and half-block rendering
+- Full mouse navigation, configurable colors, key bindings and desktop notifications
 - Safe filename handling and contact/push-name refreshes
 - Responsive keyboard-first interface with message bubbles, chat search and a command palette
 - Non-blocking background tasks with progress in the footer and completion/error toasts
@@ -33,6 +34,10 @@ Rust 1.97.1 is pinned by `rust-toolchain.toml`.
 cargo build --release --locked
 cargo install --path . --locked
 ```
+
+Audio and video playback requires `ffmpeg` and `ffprobe` in `PATH`. Photos, static/animated WebP
+stickers, documents and normal chat operation continue to work when FFmpeg is unavailable. Audio
+output uses the platform's default device (ALSA on Linux).
 
 Or use the Makefile:
 
@@ -69,8 +74,19 @@ The default global keys are:
 | `Ctrl+q` | Quit |
 | `Ctrl+c` / `Ctrl+v` | Copy/paste a selected user ID |
 
-In the message panel, use arrows or `j`/`k` to select a message. The defaults are `d` download,
-`o` open, `s` show image, `u` open URL, `i` info and `r` revoke.
+In the message panel, use arrows or `j`/`k` to select a message. `Enter` performs its primary
+action: view a photo/sticker, play audio/video, or download a document. The legacy defaults remain:
+`d` download, `o` open in a system application, `s` external image preview, `u` open URL, `i` info
+and `r` revoke.
+
+Mouse support is enabled by default. Click a conversation to open it, a message to select it, or
+the action displayed inside a media bubble to activate it. The wheel scrolls the list beneath the
+pointer, and clicking the composer positions its cursor. Palette/search results, confirmations and
+all media controls are clickable.
+
+The media modal uses `Space` to play/pause, `Left`/`Right` to seek 10 seconds, `-`/`+` to change
+volume by 5%, `m` to mute and `Esc` to close. Its progress bar is clickable. Only one item plays at
+a time; closing, replacing media or exiting cancels its decoder processes.
 
 Commands use `/` by default:
 
@@ -85,6 +101,9 @@ Commands use `/` by default:
 /sendimage /path/file    send an image
 /sendvideo /path/file    send a video
 /sendaudio /path/file    send audio
+/view message-id         view a photo or WebP sticker in the TUI
+/play message-id         play an audio or video message in the TUI
+/download message-id     save media without overwriting an existing file
 /leave                   leave the current group
 /create [jid ...] name   create a group
 /subject new name        change the group subject
@@ -106,9 +125,10 @@ then returns focus to the composer.
 Configuration is stored at `~/.config/whatscli/whatscli.config`. Missing files are created with
 defaults. The legacy INI sections and keys (`general`, `keymap`, `ui`, `colors`) are preserved.
 
-Images can be rendered through an external command such as `jp2a`; configure `show_command`.
-Downloads and previews use `download_path` and `preview_path`. Desktop notifications are enabled
-with `enable_notifications = true`, or use `use_terminal_bell = true`.
+The legacy `s` preview can still render images through an external command such as `jp2a`; configure
+`show_command` and `preview_path`. Explicit downloads use `download_path`, are written atomically,
+sanitize hostile names and add a numeric suffix instead of overwriting an existing file. Desktop
+notifications are enabled with `enable_notifications = true`, or use `use_terminal_bell = true`.
 
 History and logging settings live in `[general]`:
 
@@ -117,7 +137,14 @@ History and logging settings live in `[general]`:
 history_sync_limit = 200  ; automatic limit per conversation; 0 is unlimited
 log_level = info          ; error, warn, info, debug, or trace
 log_retention_days = 7    ; daily files retained; minimum 1
+media_cache_path = ~/.cache/whatscli/media
+media_cache_retention_days = 30
+media_cache_max_mb = 1024
 ```
+
+Internal previews use the separate XDG media cache. Startup cleanup first removes entries not
+accessed within the retention period, then evicts the least recently used files until the size is
+within the configured limit. Cached media is never treated as an explicit download.
 
 Conversation metadata, contacts, ordering, unread counters and recent messages are cached in
 `~/.config/whatscli/cache.db`, separately from the encrypted protocol session. The cache is loaded
@@ -150,10 +177,12 @@ color_mode = auto           ; auto, truecolor, or ansi16
 wide_breakpoint = 100
 compact_breakpoint = 72
 short_height = 18
+mouse_enabled = true
 
 [keymap]
 open_palette = Ctrl+p
 search_chats = Ctrl+f
+message_activate = Enter
 ```
 
 At 100 columns and above, conversations include a preview, time and unread badge. Between 72 and
@@ -169,6 +198,8 @@ WhatsCLI never rewrites an existing configuration file silently.
 - `src/session.rs`: background supervisor, categorized workers, WhatsApp session and integrations
 - `src/storage.rs`: exclusive in-memory storage actor and coalesced UI/cache snapshots
 - `src/cache.rs`: versioned conversation-cache schema, hydration, pruning and SQLite writer
+- `src/media.rs`: FFprobe metadata, FFmpeg frame/PCM workers, Rodio output and image protocols
+- `src/media_cache.rs`: retention/size cleanup and atomic cache/download installation
 - `src/config.rs`: XDG paths and backwards-compatible INI configuration
 - `src/qr.rs`: terminal QR rendering
 

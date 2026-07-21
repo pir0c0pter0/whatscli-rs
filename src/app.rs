@@ -3,7 +3,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{Event as TerminalEvent, EventStream, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event as TerminalEvent, EventStream, KeyCode,
+    KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -14,12 +17,18 @@ use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
 use crate::config::Config;
-use crate::model::{Chat, Command, ConnectionState, Message, SessionStatus, TaskInfo, UiEvent};
+use crate::media::MediaController;
+use crate::model::{
+    Chat, Command, ConnectionState, Message, MessageKind, SessionStatus, TaskInfo, UiEvent,
+};
 use crate::session::{BackgroundHandle, SessionManager};
 use crate::terminal_safe_text;
 use crate::ui::editor::Editor;
 use crate::ui::theme::Theme;
-use crate::ui::{Focus, Overlay, Toast, ToastKind, ViewModel, chat_results, palette_results};
+use crate::ui::{
+    Focus, Interaction, InteractionMap, Overlay, Toast, ToastKind, ViewModel, chat_results,
+    palette_results,
+};
 
 pub struct App {
     config: Arc<Config>,
@@ -39,10 +48,28 @@ pub struct App {
     active_tasks: Vec<TaskInfo>,
     closing: bool,
     should_quit: bool,
+    interactions: InteractionMap,
+    media: MediaController,
 }
 
 impl App {
     pub async fn new(config: Config) -> Result<Self> {
+        match crate::media_cache::prune(
+            config.general.media_cache_path.clone(),
+            config.general.media_cache_retention_days,
+            config.general.media_cache_max_mb,
+        )
+        .await
+        {
+            Ok(report) if report.expired > 0 || report.evicted > 0 => log::info!(
+                "media cache cleanup expired={} evicted={} bytes_remaining={}",
+                report.expired,
+                report.evicted,
+                report.bytes_remaining
+            ),
+            Err(error) => log::warn!("{error}"),
+            _ => {}
+        }
         let config = Arc::new(config);
         let (commands, events, background) =
             SessionManager::start(Arc::clone(&config)).into_parts();
@@ -73,13 +100,19 @@ impl App {
             active_tasks: Vec::new(),
             closing: false,
             should_quit: false,
+            interactions: InteractionMap::default(),
+            media: MediaController::fallback(),
         }
     }
 
     pub async fn run(mut self) -> Result<()> {
-        let mut terminal = TerminalGuard::new()?;
+        let mut terminal = TerminalGuard::new(self.config.ui.mouse_enabled)?;
+        self.media = MediaController::new(
+            ratatui_image::picker::Picker::from_query_stdio()
+                .unwrap_or_else(|_| ratatui_image::picker::Picker::from_fontsize((8, 16))),
+        );
         let mut reader = EventStream::new();
-        let mut tick = tokio::time::interval(Duration::from_millis(250));
+        let mut tick = tokio::time::interval(Duration::from_millis(1000 / 15));
         while !self.should_quit {
             self.expire_feedback();
             terminal.terminal.draw(|frame| self.draw(frame))?;
@@ -87,6 +120,7 @@ impl App {
                 maybe_event = reader.next() => {
                     match maybe_event {
                         Some(Ok(TerminalEvent::Key(key))) if key.kind == crossterm::event::KeyEventKind::Press => self.handle_key(key).await?,
+                        Some(Ok(TerminalEvent::Mouse(mouse))) if self.config.ui.mouse_enabled => self.handle_mouse(mouse).await?,
                         Some(Err(error)) => return Err(error.into()),
                         None => break,
                         _ => {}
@@ -95,10 +129,11 @@ impl App {
                 maybe_event = self.events.recv() => {
                     if let Some(event) = maybe_event { self.handle_ui_event(event).await?; }
                 }
-                _ = tick.tick() => self.expire_feedback(),
+                _ = tick.tick() => { self.expire_feedback(); self.media.tick(); },
                 _ = tokio::signal::ctrl_c() => self.should_quit = true,
             }
         }
+        self.media.close();
         self.closing = true;
         terminal.terminal.draw(|frame| self.draw(frame))?;
         if let Some(background) = self.background.take() {
@@ -107,8 +142,8 @@ impl App {
         Ok(())
     }
 
-    fn draw(&self, frame: &mut ratatui::Frame<'_>) {
-        crate::ui::draw(
+    fn draw(&mut self, frame: &mut ratatui::Frame<'_>) {
+        let interactions = crate::ui::draw(
             frame,
             &ViewModel {
                 config: &self.config,
@@ -125,8 +160,13 @@ impl App {
                 toast: self.toast.as_ref(),
                 active_tasks: &self.active_tasks,
                 closing: self.closing,
+                media: self.media.view(),
             },
         );
+        if let Some(area) = interactions.media_image_area {
+            self.media.render(frame, area);
+        }
+        self.interactions = interactions;
     }
 
     async fn handle_ui_event(&mut self, event: UiEvent) -> Result<()> {
@@ -171,6 +211,10 @@ impl App {
                     title: "Image preview".into(),
                     body,
                 });
+            }
+            UiEvent::MediaReady { path, kind, title } => {
+                self.overlay = None;
+                self.media.open(path, kind, title).await;
             }
             UiEvent::Text(text) => {
                 let lower = text.to_ascii_lowercase();
@@ -232,6 +276,9 @@ impl App {
     }
 
     async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
+        if self.media.is_open() {
+            return self.handle_media_key(key);
+        }
         if self.overlay.is_some() {
             return self.handle_overlay_key(key).await;
         }
@@ -300,6 +347,137 @@ impl App {
             Focus::Chats => self.handle_chat_key(key),
             Focus::Messages => self.handle_message_key(key),
         }
+    }
+
+    fn handle_media_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc => self.media.close(),
+            KeyCode::Char(' ') => self.media.toggle(),
+            KeyCode::Left => self.media.seek_relative(-10),
+            KeyCode::Right => self.media.seek_relative(10),
+            KeyCode::Char('-') => self.media.adjust_volume(-0.05),
+            KeyCode::Char('+') | KeyCode::Char('=') => self.media.adjust_volume(0.05),
+            KeyCode::Char('m') => self.media.toggle_mute(),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
+        let x = mouse.column;
+        let y = mouse.row;
+        match mouse.kind {
+            MouseEventKind::ScrollUp => return self.handle_mouse_scroll(x, y, -1),
+            MouseEventKind::ScrollDown => return self.handle_mouse_scroll(x, y, 1),
+            MouseEventKind::Down(MouseButton::Left) => {}
+            _ => return Ok(()),
+        }
+        let Some(hit) = self.interactions.hit_region(x, y) else {
+            return Ok(());
+        };
+        match hit.interaction {
+            Interaction::Chat(index) => {
+                self.chat_index = index;
+                self.select_current_chat()?;
+                self.focus = Focus::Messages;
+            }
+            Interaction::Message(index) => {
+                self.message_index = index;
+                self.focus = Focus::Messages;
+            }
+            Interaction::MessageAction(index) => {
+                self.message_index = index;
+                self.focus = Focus::Messages;
+                self.activate_message(index)?;
+            }
+            Interaction::Composer { width, .. } => {
+                self.focus = Focus::Input;
+                self.editor
+                    .set_cursor_column(x.saturating_sub(hit.rect.x) as usize, width as usize);
+            }
+            Interaction::PaletteRow(row) => {
+                let command =
+                    if let Some(Overlay::Palette { query, selected }) = self.overlay.as_mut() {
+                        *selected = row;
+                        palette_results(query.text()).get(row).copied()
+                    } else {
+                        None
+                    };
+                if let Some(command) = command {
+                    self.overlay = None;
+                    self.activate_palette(command).await?;
+                }
+            }
+            Interaction::SearchRow(row) => {
+                let index =
+                    if let Some(Overlay::ChatSearch { query, selected }) = self.overlay.as_mut() {
+                        *selected = row;
+                        chat_results(query.text(), &self.chats).get(row).copied()
+                    } else {
+                        None
+                    };
+                if let Some(index) = index {
+                    self.chat_index = index;
+                    self.overlay = None;
+                    self.focus = Focus::Input;
+                    self.select_current_chat()?;
+                }
+            }
+            Interaction::Confirm => {
+                self.handle_overlay_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                    .await?;
+            }
+            Interaction::Cancel => self.overlay = None,
+            Interaction::MediaClose => self.media.close(),
+            Interaction::MediaToggle => self.media.toggle(),
+            Interaction::MediaSeek(seconds) if seconds < 0.0 => self.media.seek_relative(-10),
+            Interaction::MediaSeek(seconds) if seconds > 0.0 => self.media.seek_relative(10),
+            Interaction::MediaSeek(_) => {
+                let fraction =
+                    f64::from(x.saturating_sub(hit.rect.x)) / f64::from(hit.rect.width.max(1));
+                self.media.seek_fraction(fraction);
+            }
+            Interaction::MediaVolumeDown => self.media.adjust_volume(-0.05),
+            Interaction::MediaVolumeUp => self.media.adjust_volume(0.05),
+            Interaction::MediaMute => self.media.toggle_mute(),
+        }
+        Ok(())
+    }
+
+    fn handle_mouse_scroll(&mut self, x: u16, y: u16, direction: i32) -> Result<()> {
+        if self.media.is_open() {
+            return Ok(());
+        }
+        if self.interactions.in_overlay(x, y) {
+            match self.overlay.as_mut() {
+                Some(Overlay::Palette { query, selected }) => {
+                    let max = palette_results(query.text()).len().saturating_sub(1);
+                    *selected = scroll_index(*selected, max, direction);
+                }
+                Some(Overlay::ChatSearch { query, selected }) => {
+                    let max = chat_results(query.text(), &self.chats)
+                        .len()
+                        .saturating_sub(1);
+                    *selected = scroll_index(*selected, max, direction);
+                }
+                _ => {}
+            }
+        } else if self.interactions.in_chats(x, y) {
+            self.focus = Focus::Chats;
+            self.chat_index = scroll_index(
+                self.chat_index,
+                self.chats.len().saturating_sub(1),
+                direction,
+            );
+        } else if self.interactions.in_messages(x, y) {
+            self.focus = Focus::Messages;
+            self.message_index = scroll_index(
+                self.message_index,
+                self.messages.len().saturating_sub(1),
+                direction,
+            );
+        }
+        Ok(())
     }
 
     async fn handle_overlay_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -461,6 +639,9 @@ impl App {
             }
             KeyCode::Char('g') => self.message_index = 0,
             KeyCode::Char('G') => self.message_index = self.messages.len().saturating_sub(1),
+            _ if matches_binding(&self.config.keymap.message_activate, key) => {
+                self.activate_message(self.message_index)?;
+            }
             _ if matches_binding(&self.config.keymap.message_info, key) => {
                 if let Some(message) = self.messages.get(self.message_index) {
                     self.overlay = Some(Overlay::MessageInfo(message_info(message)));
@@ -495,6 +676,20 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn activate_message(&mut self, index: usize) -> Result<()> {
+        let Some(message) = self.messages.get(index) else {
+            return Ok(());
+        };
+        let command = match message.kind {
+            MessageKind::Image | MessageKind::Sticker => "view",
+            MessageKind::Audio | MessageKind::Video => "play",
+            MessageKind::Document => "download",
+            _ => return Ok(()),
+        };
+        let id = message.id.clone();
+        self.send_command(command, vec![id])
     }
 
     async fn submit_input(&mut self) -> Result<()> {
@@ -690,24 +885,76 @@ fn matches_binding(spec: &str, event: KeyEvent) -> bool {
 
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
+    mouse_enabled: bool,
 }
 
 impl TerminalGuard {
-    fn new() -> Result<Self> {
+    fn new(mouse_enabled: bool) -> Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
-        let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-        terminal.clear()?;
-        Ok(Self { terminal })
+        let enter = if mouse_enabled {
+            execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
+        } else {
+            execute!(stdout, EnterAlternateScreen)
+        };
+        if let Err(error) = enter {
+            let _ = disable_raw_mode();
+            return Err(error.into());
+        }
+        let mut terminal = match Terminal::new(CrosstermBackend::new(stdout)) {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                let mut stdout = io::stdout();
+                if mouse_enabled {
+                    let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+                } else {
+                    let _ = execute!(stdout, LeaveAlternateScreen);
+                }
+                let _ = disable_raw_mode();
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = terminal.clear() {
+            if mouse_enabled {
+                let _ = execute!(
+                    terminal.backend_mut(),
+                    DisableMouseCapture,
+                    LeaveAlternateScreen
+                );
+            } else {
+                let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+            }
+            let _ = disable_raw_mode();
+            return Err(error.into());
+        }
+        Ok(Self {
+            terminal,
+            mouse_enabled,
+        })
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        if self.mouse_enabled {
+            let _ = execute!(
+                self.terminal.backend_mut(),
+                DisableMouseCapture,
+                LeaveAlternateScreen
+            );
+        } else {
+            let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        }
         let _ = self.terminal.show_cursor();
+    }
+}
+
+fn scroll_index(current: usize, max: usize, direction: i32) -> usize {
+    if direction < 0 {
+        current.saturating_sub(3)
+    } else {
+        current.saturating_add(3).min(max)
     }
 }
 
@@ -770,7 +1017,7 @@ mod tests {
         app
     }
 
-    fn render(app: &App, width: u16, height: u16) -> String {
+    fn render(app: &mut App, width: u16, height: u16) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| app.draw(frame)).unwrap();
@@ -788,11 +1035,11 @@ mod tests {
 
     #[test]
     fn responsive_layout_snapshots() {
-        let app = test_app();
-        insta::assert_snapshot!("layout_wide", render(&app, 120, 32));
-        insta::assert_snapshot!("layout_medium", render(&app, 86, 26));
-        insta::assert_snapshot!("layout_narrow", render(&app, 60, 24));
-        insta::assert_snapshot!("layout_short", render(&app, 100, 12));
+        let mut app = test_app();
+        insta::assert_snapshot!("layout_wide", render(&mut app, 120, 32));
+        insta::assert_snapshot!("layout_medium", render(&mut app, 86, 26));
+        insta::assert_snapshot!("layout_narrow", render(&mut app, 60, 24));
+        insta::assert_snapshot!("layout_short", render(&mut app, 100, 12));
     }
 
     #[test]
@@ -802,19 +1049,19 @@ mod tests {
             query: Editor::new("send"),
             selected: 0,
         });
-        insta::assert_snapshot!("command_palette", render(&app, 100, 28));
+        insta::assert_snapshot!("command_palette", render(&mut app, 100, 28));
         app.overlay = Some(Overlay::ChatSearch {
             query: Editor::new("maria"),
             selected: 0,
         });
-        insta::assert_snapshot!("chat_search", render(&app, 100, 28));
+        insta::assert_snapshot!("chat_search", render(&mut app, 100, 28));
         app.overlay = Some(Overlay::Help);
-        insta::assert_snapshot!("help", render(&app, 100, 28));
+        insta::assert_snapshot!("help", render(&mut app, 100, 28));
         app.overlay = Some(Overlay::Pairing {
             code: "████  ██\n██  ████\n████████".into(),
             expires_at: Instant::now() + Duration::from_secs(45),
         });
-        insta::assert_snapshot!("pairing", render(&app, 100, 28));
+        insta::assert_snapshot!("pairing", render(&mut app, 100, 28));
     }
 
     #[test]
@@ -822,14 +1069,14 @@ mod tests {
         let mut app = test_app();
         app.selected_chat.clear();
         app.messages.clear();
-        insta::assert_snapshot!("conversation_empty", render(&app, 100, 24));
+        insta::assert_snapshot!("conversation_empty", render(&mut app, 100, 24));
 
         app.toast = Some(Toast {
             kind: ToastKind::Error,
             message: "Connection failed. Try again.".into(),
             expires_at: Instant::now() + Duration::from_secs(5),
         });
-        insta::assert_snapshot!("toast_error", render(&app, 100, 24));
+        insta::assert_snapshot!("toast_error", render(&mut app, 100, 24));
 
         let mut truecolor = (*app.config).clone();
         truecolor.ui.color_mode = "truecolor".into();
@@ -839,7 +1086,7 @@ mod tests {
             format!(
                 "{:?}\n{}",
                 Theme::from_config(&app.config),
-                render(&app, 100, 24)
+                render(&mut app, 100, 24)
             )
         );
 
@@ -851,7 +1098,7 @@ mod tests {
             format!(
                 "{:?}\n{}",
                 Theme::from_config(&app.config),
-                render(&app, 100, 24)
+                render(&mut app, 100, 24)
             )
         );
     }
@@ -871,7 +1118,7 @@ mod tests {
                 label: "syncing history".into(),
             },
         ];
-        insta::assert_snapshot!("active_tasks", render(&app, 100, 24));
+        insta::assert_snapshot!("active_tasks", render(&mut app, 100, 24));
     }
 
     #[tokio::test]
@@ -990,5 +1237,142 @@ mod tests {
         .unwrap();
         assert!(app.active_tasks.is_empty());
         assert_eq!(app.toast.as_ref().unwrap().kind, ToastKind::Error);
+    }
+
+    #[tokio::test]
+    async fn mouse_selects_message_body_and_only_action_button_activates_media() {
+        let mut app = test_app();
+        let (command_tx, mut command_rx) = mpsc::channel(8);
+        app.commands = command_tx;
+        app.messages[0].kind = MessageKind::Image;
+        app.messages[0].text = "A photo\nwith a multiline caption".into();
+        app.message_index = 1;
+        let _ = render(&mut app, 86, 26);
+        let body = app
+            .interactions
+            .regions
+            .iter()
+            .find(|hit| hit.interaction == Interaction::Message(0))
+            .copied()
+            .unwrap();
+        let action = app
+            .interactions
+            .regions
+            .iter()
+            .find(|hit| hit.interaction == Interaction::MessageAction(0))
+            .copied()
+            .unwrap();
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: body.rect.x,
+            row: body.rect.y,
+            modifiers: KeyModifiers::NONE,
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.message_index, 0);
+        assert!(command_rx.try_recv().is_err());
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: action.rect.x,
+            row: action.rect.y,
+            modifiers: KeyModifiers::NONE,
+        })
+        .await
+        .unwrap();
+        let command = command_rx.try_recv().unwrap();
+        assert_eq!(command.name, "view");
+        assert_eq!(command.params, ["1"]);
+    }
+
+    #[test]
+    fn interaction_map_tracks_responsive_layout_unread_separator_and_composer() {
+        let mut app = test_app();
+        app.messages[0].text = "long text ".repeat(20);
+        app.messages[1].unread = true;
+        for (width, height) in [(120, 32), (86, 26), (60, 24), (100, 12)] {
+            let _ = render(&mut app, width, height);
+            assert!(app.interactions.messages_area.is_some());
+            assert!(
+                app.interactions
+                    .regions
+                    .iter()
+                    .any(|hit| matches!(hit.interaction, Interaction::Composer { .. }))
+            );
+            assert!(
+                app.interactions
+                    .regions
+                    .iter()
+                    .any(|hit| hit.interaction == Interaction::Message(app.message_index))
+            );
+            if width >= app.config.ui.compact_breakpoint {
+                assert!(app.interactions.chats_area.is_some());
+                assert!(
+                    app.interactions
+                        .regions
+                        .iter()
+                        .any(|hit| matches!(hit.interaction, Interaction::Chat(_)))
+                );
+            }
+        }
+        app.overlay = Some(Overlay::Palette {
+            query: Editor::default(),
+            selected: 0,
+        });
+        let _ = render(&mut app, 86, 26);
+        assert!(
+            app.interactions
+                .regions
+                .iter()
+                .any(|hit| matches!(hit.interaction, Interaction::PaletteRow(_)))
+        );
+        app.overlay = Some(Overlay::Confirm {
+            title: "Confirm?".into(),
+            command: "reset".into(),
+            params: Vec::new(),
+        });
+        let _ = render(&mut app, 86, 26);
+        assert!(
+            app.interactions
+                .regions
+                .iter()
+                .any(|hit| hit.interaction == Interaction::Confirm)
+        );
+        assert!(
+            app.interactions
+                .regions
+                .iter()
+                .any(|hit| hit.interaction == Interaction::Cancel)
+        );
+    }
+
+    #[test]
+    fn media_action_button_snapshots_are_responsive() {
+        let mut app = test_app();
+        app.focus = Focus::Messages;
+        app.messages[0].kind = MessageKind::Image;
+        app.messages[0].file_name = "photo.webp".into();
+        app.messages[1].kind = MessageKind::Document;
+        app.messages[1].file_name = "report.pdf".into();
+        insta::assert_snapshot!("media_actions_wide", render(&mut app, 120, 32));
+        insta::assert_snapshot!("media_actions_compact", render(&mut app, 86, 26));
+        insta::assert_snapshot!("media_actions_narrow", render(&mut app, 60, 24));
+        insta::assert_snapshot!("media_actions_short", render(&mut app, 100, 12));
+    }
+
+    #[tokio::test]
+    async fn media_error_modal_snapshots_are_responsive() {
+        let path = std::env::temp_dir().join(format!("whatscli-modal-{}", std::process::id()));
+        tokio::fs::write(&path, b"corrupt").await.unwrap();
+        let mut app = test_app();
+        app.media
+            .open(path.clone(), MessageKind::Image, "photo.webp".into())
+            .await;
+        insta::assert_snapshot!("media_modal_wide", render(&mut app, 120, 32));
+        insta::assert_snapshot!("media_modal_compact", render(&mut app, 86, 26));
+        insta::assert_snapshot!("media_modal_narrow", render(&mut app, 60, 24));
+        insta::assert_snapshot!("media_modal_short", render(&mut app, 100, 12));
+        let _ = tokio::fs::remove_file(path).await;
     }
 }

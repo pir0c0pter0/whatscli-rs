@@ -1,32 +1,32 @@
 ---
 source: src/app.rs
-expression: "render(&app, 100, 28)"
+expression: "render(&mut app, 100, 28)"
 ---
  WhatsCLI v1.1.5  Maria Oliveira ● online
   conversations / thread / composer
- Conversations               │ ──────── unread messages ────────
- › • Maria Oliveira [2]      │  Maria
-     Você viu ┌ Keyboard help ───────────────────────────────────────────────────────┐
-     ◇ message│                                                                      │
-   # Equipe Pr│ Navigation                                                           │
-     Ravi: rev│   Tab          switch chats/composer                                 │
-     ◇ message│   Ctrl+w       focus messages                                        │ te mando as
-              │   Ctrl+f       search conversations                                  │
-              │   Ctrl+p       command palette                                       │
+ Conversations┌ Keyboard & mouse help ───────────────────────────────────────────────┐
+ › • Maria Oli│                                                                      │
+     Você viu │ Navigation                                                           │
+     ◇ message│   Tab          switch chats/composer                                 │
+   # Equipe Pr│   Ctrl+w       focus messages                                        │
+     Ravi: rev│   Ctrl+f       search conversations                                  │
+     ◇ message│   Ctrl+p       command palette                                       │ te mando as
               │                                                                      │
               │ Composer                                                             │
               │   ←/→ Home End   move cursor by grapheme                             │
               │   Backspace/Delete edit safely · Enter sends                         │
               │                                                                      │
               │ Messages                                                             │
-              │   d/o/s/u/i/r  download/open/show/url/info/revoke                    │
+              │   Enter/d/o/s/u/i/r  activate/download/open/show/url/info/revoke     │
+              │   Media: Space pause · ←/→ seek · -/+ volume · m mute                │
+              │                                                                      │
+              │ Mouse                                                                │
+              │   Click selects · media button activates · wheel navigates           │
               │                                                                      │
               │ Config: /home/mariostjr/.config/whatscli/whatscli.config             │
               │ Esc closes this overlay                                              │
               │                                                                      │
-              │                                                                      │
-              └──────────────────────────────────────────────────────────────────────┘
-┌ Message ─────────────────────────────────────────────────────────────────────────────────────────┐
-│ Type a message or /command                                                                       │
+┌ Message ────│                                                                      │─────────────┐
+│ Type a messa└──────────────────────────────────────────────────────────────────────┘             │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
  Enter send  ·  Ctrl+p commands  ·  Ctrl+f search  ·  Tab chats

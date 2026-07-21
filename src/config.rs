@@ -8,6 +8,9 @@ use ini::Ini;
 pub struct General {
     pub download_path: PathBuf,
     pub preview_path: PathBuf,
+    pub media_cache_path: PathBuf,
+    pub media_cache_retention_days: u64,
+    pub media_cache_max_mb: u64,
     pub cmd_prefix: String,
     pub show_command: String,
     pub enable_notifications: bool,
@@ -35,6 +38,7 @@ pub struct Keymap {
     pub command_quit: String,
     pub command_help: String,
     pub message_download: String,
+    pub message_activate: String,
     pub message_open: String,
     pub message_show: String,
     pub message_url: String,
@@ -50,6 +54,7 @@ pub struct Ui {
     pub wide_breakpoint: u16,
     pub compact_breakpoint: u16,
     pub short_height: u16,
+    pub mouse_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -88,10 +93,17 @@ impl Default for Config {
         let config_dir = dirs::config_dir()
             .unwrap_or_else(|| home.join(".config"))
             .join("whatscli");
+        let cache_dir = dirs::cache_dir()
+            .unwrap_or_else(|| home.join(".cache"))
+            .join("whatscli")
+            .join("media");
         Self {
             general: General {
                 download_path: home.join("Downloads"),
                 preview_path: home.join("Downloads"),
+                media_cache_path: cache_dir,
+                media_cache_retention_days: 30,
+                media_cache_max_mb: 1024,
                 cmd_prefix: "/".into(),
                 show_command: "jp2a --color".into(),
                 enable_notifications: false,
@@ -117,6 +129,7 @@ impl Default for Config {
                 command_quit: "Ctrl+q".into(),
                 command_help: "Ctrl+?".into(),
                 message_download: "d".into(),
+                message_activate: "Enter".into(),
                 message_open: "o".into(),
                 message_show: "s".into(),
                 message_url: "u".into(),
@@ -130,6 +143,7 @@ impl Default for Config {
                 wide_breakpoint: 100,
                 compact_breakpoint: 72,
                 short_height: 18,
+                mouse_enabled: true,
             },
             colors: Colors {
                 background: "black".into(),
@@ -177,6 +191,16 @@ impl Config {
                 path_value(s.get("download_path"), &config.general.download_path);
             config.general.preview_path =
                 path_value(s.get("preview_path"), &config.general.preview_path);
+            config.general.media_cache_path =
+                path_value(s.get("media_cache_path"), &config.general.media_cache_path);
+            config.general.media_cache_retention_days = number_value(
+                s.get("media_cache_retention_days"),
+                config.general.media_cache_retention_days,
+            );
+            config.general.media_cache_max_mb = number_value(
+                s.get("media_cache_max_mb"),
+                config.general.media_cache_max_mb,
+            );
             string_value(&mut config.general.cmd_prefix, s.get("cmd_prefix"));
             string_value(&mut config.general.show_command, s.get("show_command"));
             config.general.enable_notifications = bool_value(
@@ -237,6 +261,7 @@ impl Config {
             key!(command_quit);
             key!(command_help);
             key!(message_download);
+            key!(message_activate);
             key!(message_open);
             key!(message_show);
             key!(message_url);
@@ -253,6 +278,7 @@ impl Config {
             config.ui.compact_breakpoint =
                 number_value(s.get("compact_breakpoint"), config.ui.compact_breakpoint);
             config.ui.short_height = number_value(s.get("short_height"), config.ui.short_height);
+            config.ui.mouse_enabled = bool_value(s.get("mouse_enabled"), config.ui.mouse_enabled);
         }
         let mut has_custom_colors = false;
         if let Some(s) = ini.section(Some("colors")) {
@@ -299,6 +325,18 @@ impl Config {
                 "preview_path",
                 self.general.preview_path.to_string_lossy().as_ref(),
             )
+            .set(
+                "media_cache_path",
+                self.general.media_cache_path.to_string_lossy().as_ref(),
+            )
+            .set(
+                "media_cache_retention_days",
+                self.general.media_cache_retention_days.to_string(),
+            )
+            .set(
+                "media_cache_max_mb",
+                self.general.media_cache_max_mb.to_string(),
+            )
             .set("cmd_prefix", &self.general.cmd_prefix)
             .set("show_command", &self.general.show_command)
             .set(
@@ -342,6 +380,7 @@ impl Config {
             .set("command_quit", &keymap.command_quit)
             .set("command_help", &keymap.command_help)
             .set("message_download", &keymap.message_download)
+            .set("message_activate", &keymap.message_activate)
             .set("message_open", &keymap.message_open)
             .set("message_show", &keymap.message_show)
             .set("message_url", &keymap.message_url)
@@ -354,6 +393,8 @@ impl Config {
             .set("wide_breakpoint", self.ui.wide_breakpoint.to_string())
             .set("compact_breakpoint", self.ui.compact_breakpoint.to_string())
             .set("short_height", self.ui.short_height.to_string());
+        ini.with_section(Some("ui"))
+            .set("mouse_enabled", self.ui.mouse_enabled.to_string());
         let c = &self.colors;
         ini.with_section(Some("colors"))
             .set("background", &c.background)
@@ -495,6 +536,10 @@ mod tests {
         assert_eq!(config.ui.compact_breakpoint, 72);
         assert_eq!(config.keymap.open_palette, "Ctrl+p");
         assert_eq!(config.keymap.search_chats, "Ctrl+f");
+        assert_eq!(config.keymap.message_activate, "Enter");
+        assert!(config.ui.mouse_enabled);
+        assert_eq!(config.general.media_cache_retention_days, 30);
+        assert_eq!(config.general.media_cache_max_mb, 1024);
         assert_eq!(config.colors, super::Colors::legacy_defaults());
     }
 
@@ -505,6 +550,8 @@ mod tests {
         assert_eq!(config.general.history_sync_limit, 200);
         assert_eq!(config.general.log_level, "info");
         assert_eq!(config.general.log_retention_days, 7);
+        assert_eq!(config.keymap.message_activate, "Enter");
+        assert!(config.ui.mouse_enabled);
         assert_eq!(fs::read_to_string(&config.config_file).unwrap(), contents);
         fs::remove_dir_all(directory).unwrap();
     }

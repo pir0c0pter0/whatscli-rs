@@ -14,6 +14,7 @@ pub enum MessageKind {
     Video,
     Audio,
     Document,
+    Sticker,
     #[default]
     Unknown,
 }
@@ -26,6 +27,7 @@ impl std::fmt::Display for MessageKind {
             Self::Video => "video",
             Self::Audio => "audio",
             Self::Document => "document",
+            Self::Sticker => "sticker",
             Self::Unknown => "unknown",
         };
         f.write_str(name)
@@ -167,6 +169,8 @@ impl Command {
             "send" => "sending message".into(),
             "backlog" | "more" => "syncing history".into(),
             "download" => "downloading media".into(),
+            "view" => "loading media viewer".into(),
+            "play" => "loading media player".into(),
             "open" => "opening media".into(),
             "show" => "rendering preview".into(),
             "clipboard-copy" => "copying to clipboard".into(),
@@ -182,7 +186,7 @@ pub fn classify_command(name: &str) -> TaskCategory {
             TaskCategory::Session
         }
         "backlog" | "more" => TaskCategory::History,
-        "download" | "open" | "show" => TaskCategory::Transfer,
+        "download" | "open" | "show" | "view" | "play" => TaskCategory::Transfer,
         "url" | "clipboard-copy" | "clipboard-paste" => TaskCategory::Integration,
         _ => TaskCategory::Conversation,
     }
@@ -219,14 +223,25 @@ pub enum UiEvent {
     Snapshot(DatabaseSnapshot),
     TaskStarted(TaskInfo),
     TaskCompleted(TaskInfo),
-    TaskFailed { task: TaskInfo, error: String },
+    TaskFailed {
+        task: TaskInfo,
+        error: String,
+    },
     QueueSaturated(TaskCategory),
     ClipboardText(String),
     Preview(String),
+    MediaReady {
+        path: std::path::PathBuf,
+        kind: MessageKind,
+        title: String,
+    },
     Text(String),
     ColorList,
     Error(String),
-    Qr { code: String, expires_in: u64 },
+    Qr {
+        code: String,
+        expires_in: u64,
+    },
     ClearQr,
 }
 
@@ -240,6 +255,8 @@ mod command_tests {
         assert_eq!(classify_command("send"), TaskCategory::Conversation);
         assert_eq!(classify_command("backlog"), TaskCategory::History);
         assert_eq!(classify_command("download"), TaskCategory::Transfer);
+        assert_eq!(classify_command("view"), TaskCategory::Transfer);
+        assert_eq!(classify_command("play"), TaskCategory::Transfer);
         assert_eq!(
             classify_command("clipboard-paste"),
             TaskCategory::Integration

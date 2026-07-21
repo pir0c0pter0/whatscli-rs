@@ -588,6 +588,7 @@ pub fn kind_to_i32(kind: MessageKind) -> i32 {
         MessageKind::Video => 3,
         MessageKind::Audio => 4,
         MessageKind::Document => 5,
+        MessageKind::Sticker => 6,
         MessageKind::Unknown => 0,
     }
 }
@@ -599,6 +600,7 @@ pub fn kind_from_i32(kind: i32) -> MessageKind {
         3 => MessageKind::Video,
         4 => MessageKind::Audio,
         5 => MessageKind::Document,
+        6 => MessageKind::Sticker,
         _ => MessageKind::Unknown,
     }
 }
@@ -618,6 +620,12 @@ mod tests {
                 std::process::id()
             ))
             .join("cache.db")
+    }
+
+    #[test]
+    fn sticker_uses_stable_persisted_value_six() {
+        assert_eq!(kind_to_i32(MessageKind::Sticker), 6);
+        assert_eq!(kind_from_i32(6), MessageKind::Sticker);
     }
 
     #[tokio::test]

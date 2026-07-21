@@ -11,12 +11,11 @@ use crossterm::terminal::{
 use futures_util::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 
 use crate::config::Config;
-use crate::model::{Chat, Command, ConnectionState, Message, SessionStatus, UiEvent};
-use crate::session::SessionManager;
-use crate::storage::MessageDatabase;
+use crate::model::{Chat, Command, ConnectionState, Message, SessionStatus, TaskInfo, UiEvent};
+use crate::session::{BackgroundHandle, SessionManager};
 use crate::terminal_safe_text;
 use crate::ui::editor::Editor;
 use crate::ui::theme::Theme;
@@ -24,9 +23,9 @@ use crate::ui::{Focus, Overlay, Toast, ToastKind, ViewModel, chat_results, palet
 
 pub struct App {
     config: Arc<Config>,
-    commands: mpsc::UnboundedSender<Command>,
-    events: mpsc::UnboundedReceiver<UiEvent>,
-    db: Arc<Mutex<MessageDatabase>>,
+    commands: mpsc::Sender<Command>,
+    events: mpsc::Receiver<UiEvent>,
+    background: Option<BackgroundHandle>,
     chats: Vec<Chat>,
     messages: Vec<Message>,
     editor: Editor,
@@ -37,28 +36,30 @@ pub struct App {
     selected_chat: String,
     overlay: Option<Overlay>,
     toast: Option<Toast>,
-    loading_history: bool,
+    active_tasks: Vec<TaskInfo>,
+    closing: bool,
     should_quit: bool,
 }
 
 impl App {
     pub async fn new(config: Config) -> Result<Self> {
         let config = Arc::new(config);
-        let (commands, events, db) = SessionManager::start(Arc::clone(&config)).await?;
-        Ok(Self::from_parts(config, commands, events, db))
+        let (commands, events, background) =
+            SessionManager::start(Arc::clone(&config)).into_parts();
+        Ok(Self::from_parts(config, commands, events, Some(background)))
     }
 
     fn from_parts(
         config: Arc<Config>,
-        commands: mpsc::UnboundedSender<Command>,
-        events: mpsc::UnboundedReceiver<UiEvent>,
-        db: Arc<Mutex<MessageDatabase>>,
+        commands: mpsc::Sender<Command>,
+        events: mpsc::Receiver<UiEvent>,
+        background: Option<BackgroundHandle>,
     ) -> Self {
         Self {
             config,
             commands,
             events,
-            db,
+            background,
             chats: Vec::new(),
             messages: Vec::new(),
             editor: Editor::default(),
@@ -69,7 +70,8 @@ impl App {
             selected_chat: String::new(),
             overlay: None,
             toast: None,
-            loading_history: false,
+            active_tasks: Vec::new(),
+            closing: false,
             should_quit: false,
         }
     }
@@ -97,7 +99,11 @@ impl App {
                 _ = tokio::signal::ctrl_c() => self.should_quit = true,
             }
         }
-        let _ = self.commands.send(Command::new("disconnect", Vec::new()));
+        self.closing = true;
+        terminal.terminal.draw(|frame| self.draw(frame))?;
+        if let Some(background) = self.background.take() {
+            background.shutdown().await;
+        }
         Ok(())
     }
 
@@ -117,7 +123,8 @@ impl App {
                 selected_chat: &self.selected_chat,
                 overlay: self.overlay.as_ref(),
                 toast: self.toast.as_ref(),
-                loading_history: self.loading_history,
+                active_tasks: &self.active_tasks,
+                closing: self.closing,
             },
         );
     }
@@ -139,28 +146,31 @@ impl App {
                     self.show_toast(ToastKind::Warning, "WhatsApp is offline");
                 }
             }
-            UiEvent::Message(message) => {
-                let message = *message;
-                let id = message.id.clone();
-                if message.chat_id == self.selected_chat {
-                    if let Some(existing) = self.messages.iter_mut().find(|item| item.id == id) {
-                        *existing = message;
-                    } else {
-                        self.messages.push(message);
-                    }
-                    self.messages
-                        .sort_by_key(|item| (item.timestamp, item.id.clone()));
-                    self.message_index = self
-                        .messages
-                        .iter()
-                        .position(|item| item.id == id)
-                        .unwrap_or_else(|| self.messages.len().saturating_sub(1));
-                }
-                self.refresh().await;
+            UiEvent::Snapshot(snapshot) => self.apply_snapshot(snapshot),
+            UiEvent::TaskStarted(task) => {
+                self.active_tasks.retain(|active| active.id != task.id);
+                self.active_tasks.push(task);
             }
-            UiEvent::Refresh => {
-                self.loading_history = false;
-                self.refresh().await;
+            UiEvent::TaskCompleted(task) => {
+                self.active_tasks.retain(|active| active.id != task.id);
+                self.show_toast(ToastKind::Success, format!("{} completed", task.label));
+            }
+            UiEvent::TaskFailed { task, error } => {
+                self.active_tasks.retain(|active| active.id != task.id);
+                self.show_toast(ToastKind::Error, error);
+            }
+            UiEvent::QueueSaturated(category) => {
+                self.show_toast(
+                    ToastKind::Error,
+                    format!("{} queue is full; task was not started", category.label()),
+                );
+            }
+            UiEvent::ClipboardText(text) => self.editor.insert_str(&text),
+            UiEvent::Preview(body) => {
+                self.overlay = Some(Overlay::Text {
+                    title: "Image preview".into(),
+                    body,
+                });
             }
             UiEvent::Text(text) => {
                 let lower = text.to_ascii_lowercase();
@@ -184,27 +194,18 @@ impl App {
                     expires_at: Instant::now() + Duration::from_secs(expires_in),
                 });
             }
-            UiEvent::Open(target) => {
-                if let Err(error) = open::that(&target) {
-                    self.show_toast(ToastKind::Error, error.to_string());
-                } else {
-                    self.show_toast(ToastKind::Success, "Opened with the system application");
-                }
-            }
-            UiEvent::ShowImage(path) => self.show_image(&path),
         }
         Ok(())
     }
 
-    async fn refresh(&mut self) {
+    fn apply_snapshot(&mut self, snapshot: crate::model::DatabaseSnapshot) {
         let selected_message = self
             .messages
             .get(self.message_index)
             .map(|message| message.id.clone());
-        let db = self.db.lock().await;
-        self.chats = db.chats();
-        if !self.selected_chat.is_empty() {
-            self.messages = db.messages(&self.selected_chat);
+        self.chats = snapshot.chats;
+        if snapshot.selected_chat == self.selected_chat {
+            self.messages = snapshot.messages;
         }
         if let Some(index) = self
             .chats
@@ -272,7 +273,6 @@ impl App {
             return self.send_command("connect", Vec::new());
         }
         if matches_binding(&keys.command_backlog, key) {
-            self.loading_history = true;
             return self.send_command("backlog", Vec::new());
         }
         if matches_binding(&keys.command_read, key) {
@@ -376,9 +376,6 @@ impl App {
                 params: Vec::new(),
             });
         } else {
-            if command.name == "backlog" {
-                self.loading_history = true;
-            }
             self.send_command(command.name, Vec::new())?;
         }
         Ok(())
@@ -524,7 +521,6 @@ impl App {
                     });
                 }
                 "backlog" | "more" => {
-                    self.loading_history = true;
                     self.send_command(name, params.to_vec())?;
                 }
                 _ => self.send_command(name, params.to_vec())?,
@@ -542,15 +538,31 @@ impl App {
         let Some(chat) = self.chats.get(self.chat_index) else {
             return Ok(());
         };
-        self.selected_chat.clone_from(&chat.id);
+        let chat_id = chat.id.clone();
+        self.selected_chat.clone_from(&chat_id);
+        self.messages.clear();
         self.message_index = 0;
-        self.send_command("select", vec![chat.id.clone()])
+        self.send_command("select", vec![chat_id])
     }
 
-    fn send_command(&self, name: &str, params: Vec<String>) -> Result<()> {
-        self.commands
-            .send(Command::new(name, params))
-            .map_err(|_| anyhow::anyhow!("session manager stopped"))
+    fn send_command(&mut self, name: &str, params: Vec<String>) -> Result<()> {
+        let command = Command::new(name, params);
+        match self.commands.try_send(command) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(command)) => {
+                self.show_toast(
+                    ToastKind::Error,
+                    format!(
+                        "{} queue is full; task was not started",
+                        command.category.label()
+                    ),
+                );
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(anyhow::anyhow!("background supervisor stopped"))
+            }
+        }
     }
 
     fn copy_selected(&mut self) {
@@ -562,50 +574,12 @@ impl App {
             self.chats.get(self.chat_index).map(|chat| chat.id.clone())
         };
         if let Some(value) = value {
-            match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(value)) {
-                Ok(()) => self.show_toast(ToastKind::Success, "User ID copied"),
-                Err(error) => {
-                    self.show_toast(ToastKind::Error, format!("Clipboard unavailable: {error}"))
-                }
-            }
+            let _ = self.send_command("clipboard-copy", vec![value]);
         }
     }
 
     fn paste_clipboard(&mut self) {
-        match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
-            Ok(text) => self.editor.insert_str(&text),
-            Err(error) => {
-                self.show_toast(ToastKind::Error, format!("Clipboard unavailable: {error}"))
-            }
-        }
-    }
-
-    fn show_image(&mut self, path: &str) {
-        let Ok(mut parts) = shell_words::split(&self.config.general.show_command) else {
-            self.show_toast(ToastKind::Error, "Invalid show_command");
-            return;
-        };
-        if parts.is_empty() {
-            self.show_toast(ToastKind::Error, "show_command is empty");
-            return;
-        }
-        let program = parts.remove(0);
-        match std::process::Command::new(program)
-            .args(parts)
-            .arg(path)
-            .output()
-        {
-            Ok(output) if output.status.success() => {
-                self.overlay = Some(Overlay::Text {
-                    title: "Image preview".into(),
-                    body: String::from_utf8_lossy(&output.stdout).into_owned(),
-                });
-            }
-            Ok(output) => {
-                self.show_toast(ToastKind::Error, String::from_utf8_lossy(&output.stderr))
-            }
-            Err(error) => self.show_toast(ToastKind::Error, error.to_string()),
-        }
+        let _ = self.send_command("clipboard-paste", Vec::new());
     }
 
     fn show_toast(&mut self, kind: ToastKind, message: impl AsRef<str>) {
@@ -735,18 +709,14 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::MessageKind;
+    use crate::model::{DatabaseSnapshot, MessageKind, TaskCategory};
+    use crate::storage::MessageDatabase;
     use ratatui::backend::TestBackend;
 
     fn test_app() -> App {
-        let (command_tx, _command_rx) = mpsc::unbounded_channel();
-        let (_event_tx, event_rx) = mpsc::unbounded_channel();
-        let mut app = App::from_parts(
-            Arc::new(Config::default()),
-            command_tx,
-            event_rx,
-            Arc::new(Mutex::new(MessageDatabase::default())),
-        );
+        let (command_tx, _command_rx) = mpsc::channel(128);
+        let (_event_tx, event_rx) = mpsc::channel(128);
+        let mut app = App::from_parts(Arc::new(Config::default()), command_tx, event_rx, None);
         app.status.state = ConnectionState::Connected;
         app.chats = vec![
             Chat {
@@ -881,6 +851,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn active_task_indicator_snapshot() {
+        let mut app = test_app();
+        app.active_tasks = vec![
+            TaskInfo {
+                id: 41,
+                category: TaskCategory::Transfer,
+                label: "downloading media".into(),
+            },
+            TaskInfo {
+                id: 42,
+                category: TaskCategory::History,
+                label: "syncing history".into(),
+            },
+        ];
+        insta::assert_snapshot!("active_tasks", render(&app, 100, 24));
+    }
+
+    #[tokio::test]
+    async fn a_full_command_queue_does_not_block_quit_or_feedback() {
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let (_event_tx, event_rx) = mpsc::channel(1);
+        command_tx
+            .try_send(Command::new("connect", Vec::new()))
+            .unwrap();
+        let mut app = App::from_parts(Arc::new(Config::default()), command_tx, event_rx, None);
+        app.send_command("backlog", Vec::new()).unwrap();
+        assert!(
+            app.toast
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("queue is full")
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(app.should_quit);
+    }
+
     #[tokio::test]
     async fn escape_closes_overlay_before_returning_to_input() {
         let mut app = test_app();
@@ -902,8 +913,12 @@ mod tests {
         let mut older = app.messages[0].clone();
         older.timestamp -= 100;
         db.add_message(older, false);
-        app.db = Arc::new(Mutex::new(db));
-        app.refresh().await;
+        app.apply_snapshot(DatabaseSnapshot {
+            selected_chat: app.selected_chat.clone(),
+            chats: db.chats(),
+            messages: db.messages(&app.selected_chat),
+            ..Default::default()
+        });
         assert_eq!(app.messages[app.message_index].id, "2");
     }
 
@@ -923,5 +938,33 @@ mod tests {
         .unwrap();
         assert!(app.overlay.is_none());
         assert_eq!(app.toast.as_ref().unwrap().kind, ToastKind::Success);
+    }
+
+    #[tokio::test]
+    async fn task_and_clipboard_results_are_applied_only_from_ui_events() {
+        let mut app = test_app();
+        let task = TaskInfo {
+            id: 9,
+            category: TaskCategory::Integration,
+            label: "reading clipboard".into(),
+        };
+        app.handle_ui_event(UiEvent::TaskStarted(task.clone()))
+            .await
+            .unwrap();
+        assert_eq!(app.active_tasks, vec![task.clone()]);
+
+        app.handle_ui_event(UiEvent::ClipboardText("async text".into()))
+            .await
+            .unwrap();
+        assert_eq!(app.editor.text(), "async text");
+
+        app.handle_ui_event(UiEvent::TaskFailed {
+            task,
+            error: "clipboard unavailable".into(),
+        })
+        .await
+        .unwrap();
+        assert!(app.active_tasks.is_empty());
+        assert_eq!(app.toast.as_ref().unwrap().kind, ToastKind::Error);
     }
 }

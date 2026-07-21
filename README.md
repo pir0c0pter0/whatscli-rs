@@ -21,6 +21,7 @@ Ratatui/Crossterm for the interface.
 - Configurable colors, key bindings, desktop notifications and terminal image previews
 - Safe filename handling and contact/push-name refreshes
 - Responsive keyboard-first interface with message bubbles, chat search and a command palette
+- Non-blocking background tasks with progress in the footer and completion/error toasts
 - WhatsApp Dark, high-contrast, custom and ANSI-16 themes
 
 ## Build and install
@@ -133,14 +134,23 @@ WhatsCLI never rewrites an existing configuration file silently.
 
 - `src/app.rs`: event routing, commands, selection and configurable key bindings
 - `src/ui/`: responsive Ratatui components, semantic themes and grapheme-safe editor
-- `src/session.rs`: async WhatsApp session, commands, events, groups and media
-- `src/storage.rs`: in-memory chat/contact/message model and ordering
+- `src/session.rs`: background supervisor, categorized workers, WhatsApp session and integrations
+- `src/storage.rs`: exclusive storage actor, in-memory model and coalesced UI snapshots
 - `src/config.rs`: XDG paths and backwards-compatible INI configuration
 - `src/qr.rs`: terminal QR rendering
 
-The Tokio runtime owns the protocol tasks. WhatsApp events and UI commands cross unbounded async
-channels, while the in-memory database is protected by a single async mutex so updates remain
-ordered and snapshots are consistent.
+The Ratatui loop only handles input, visual state and drawing. A Tokio supervisor owns the protocol,
+session, per-conversation, history, transfer and system-integration workers. All queues are bounded;
+the UI submits work without waiting and reports saturation immediately. The in-memory database is
+owned exclusively by a storage actor, which coalesces consistent conversation/message snapshots
+before sending them to the UI. Synchronous clipboard, opener, notification and preview APIs run in
+Tokio's blocking pool.
+
+The footer shows the most recently active background task and `+N` when other tasks are running.
+On exit, WhatsCLI stops accepting new work, disconnects the client, drains workers for up to three
+seconds, cancels anything still pending and then restores the terminal.
+
+See [CHANGELOG.md](CHANGELOG.md) for user-visible and architectural changes.
 
 ## License
 

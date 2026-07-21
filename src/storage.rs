@@ -1,8 +1,280 @@
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Local};
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 
-use crate::model::{CONTACT_SUFFIX, Chat, Contact, GROUP_SUFFIX, Message, MessageKind};
+use crate::model::{
+    CONTACT_SUFFIX, Chat, Contact, DatabaseSnapshot, GROUP_SUFFIX, Message, MessageKind, UiEvent,
+};
+
+pub const QUEUE_CAPACITY: usize = 128;
+
+#[derive(Clone)]
+pub struct StorageHandle {
+    tx: mpsc::Sender<StorageCommand>,
+}
+
+enum StorageCommand {
+    Select(String),
+    AddMessage(Message, bool, oneshot::Sender<bool>),
+    AddChat(Chat),
+    ResolveContact {
+        id: String,
+        fallback: String,
+        push_name: String,
+        reply: oneshot::Sender<(String, String)>,
+    },
+    UpdatePushName(String, String, String),
+    UpdatePushNames(HashMap<String, String>),
+    RefreshContactNames,
+    UpdateChatUnread(String, usize),
+    MarkChatRead(String, oneshot::Sender<Vec<Message>>),
+    MarkMessageRevoked(String, oneshot::Sender<bool>),
+    Message(String, oneshot::Sender<Option<Message>>),
+    OldestMessage(String, oneshot::Sender<Option<Message>>),
+    MessageInfo(String, oneshot::Sender<String>),
+}
+
+pub fn start_storage_actor(ui_tx: mpsc::Sender<UiEvent>) -> (StorageHandle, JoinHandle<()>) {
+    let (tx, rx) = mpsc::channel(QUEUE_CAPACITY);
+    let handle = StorageHandle { tx };
+    let task = tokio::spawn(storage_actor(rx, ui_tx));
+    (handle, task)
+}
+
+impl StorageHandle {
+    async fn send(&self, command: StorageCommand) -> Result<()> {
+        self.tx
+            .send(command)
+            .await
+            .map_err(|_| anyhow!("storage worker stopped"))
+    }
+
+    pub async fn select(&self, chat_id: String) -> Result<()> {
+        self.send(StorageCommand::Select(chat_id)).await
+    }
+
+    pub async fn add_message(&self, message: Message, mark_unread: bool) -> Result<bool> {
+        let (reply, response) = oneshot::channel();
+        self.send(StorageCommand::AddMessage(message, mark_unread, reply))
+            .await?;
+        response
+            .await
+            .map_err(|_| anyhow!("storage worker stopped"))
+    }
+
+    pub async fn add_chat(&self, chat: Chat) -> Result<()> {
+        self.send(StorageCommand::AddChat(chat)).await
+    }
+
+    pub async fn resolve_contact(
+        &self,
+        id: String,
+        fallback: String,
+        push_name: String,
+    ) -> Result<(String, String)> {
+        let (reply, response) = oneshot::channel();
+        self.send(StorageCommand::ResolveContact {
+            id,
+            fallback,
+            push_name,
+            reply,
+        })
+        .await?;
+        response
+            .await
+            .map_err(|_| anyhow!("storage worker stopped"))
+    }
+
+    pub async fn update_push_name(
+        &self,
+        id: String,
+        old_name: String,
+        new_name: String,
+    ) -> Result<()> {
+        self.send(StorageCommand::UpdatePushName(id, old_name, new_name))
+            .await
+    }
+
+    pub async fn update_push_names(&self, names: HashMap<String, String>) -> Result<()> {
+        self.send(StorageCommand::UpdatePushNames(names)).await
+    }
+
+    pub async fn refresh_contact_names(&self) -> Result<()> {
+        self.send(StorageCommand::RefreshContactNames).await
+    }
+
+    pub async fn update_chat_unread(&self, chat_id: String, unread: usize) -> Result<()> {
+        self.send(StorageCommand::UpdateChatUnread(chat_id, unread))
+            .await
+    }
+
+    pub async fn mark_chat_read(&self, chat_id: String) -> Result<Vec<Message>> {
+        let (reply, response) = oneshot::channel();
+        self.send(StorageCommand::MarkChatRead(chat_id, reply))
+            .await?;
+        response
+            .await
+            .map_err(|_| anyhow!("storage worker stopped"))
+    }
+
+    pub async fn mark_message_revoked(&self, id: String) -> Result<bool> {
+        let (reply, response) = oneshot::channel();
+        self.send(StorageCommand::MarkMessageRevoked(id, reply))
+            .await?;
+        response
+            .await
+            .map_err(|_| anyhow!("storage worker stopped"))
+    }
+
+    pub async fn message(&self, id: String) -> Result<Option<Message>> {
+        let (reply, response) = oneshot::channel();
+        self.send(StorageCommand::Message(id, reply)).await?;
+        response
+            .await
+            .map_err(|_| anyhow!("storage worker stopped"))
+    }
+
+    pub async fn oldest_message(&self, chat_id: String) -> Result<Option<Message>> {
+        let (reply, response) = oneshot::channel();
+        self.send(StorageCommand::OldestMessage(chat_id, reply))
+            .await?;
+        response
+            .await
+            .map_err(|_| anyhow!("storage worker stopped"))
+    }
+
+    pub async fn message_info(&self, id: String) -> Result<String> {
+        let (reply, response) = oneshot::channel();
+        self.send(StorageCommand::MessageInfo(id, reply)).await?;
+        response
+            .await
+            .map_err(|_| anyhow!("storage worker stopped"))
+    }
+}
+
+async fn storage_actor(mut rx: mpsc::Receiver<StorageCommand>, ui_tx: mpsc::Sender<UiEvent>) {
+    let mut database = MessageDatabase::default();
+    let mut selected_chat = String::new();
+    let mut revision = 0_u64;
+    let mut dirty = true;
+    let start = tokio::time::Instant::now() + Duration::from_millis(16);
+    let mut snapshots = tokio::time::interval_at(start, Duration::from_millis(16));
+    snapshots.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            command = rx.recv() => {
+                let Some(command) = command else { break };
+                let changed = apply_storage_command(command, &mut database, &mut selected_chat);
+                if changed {
+                    revision = revision.wrapping_add(1);
+                    dirty = true;
+                }
+            }
+            _ = snapshots.tick(), if dirty => {
+                let snapshot = DatabaseSnapshot {
+                    revision,
+                    selected_chat: selected_chat.clone(),
+                    chats: database.chats(),
+                    messages: database.messages(&selected_chat),
+                };
+                match ui_tx.try_send(UiEvent::Snapshot(snapshot)) {
+                    Ok(()) => dirty = false,
+                    Err(mpsc::error::TrySendError::Full(_)) => {}
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                }
+            }
+        }
+    }
+}
+
+fn apply_storage_command(
+    command: StorageCommand,
+    database: &mut MessageDatabase,
+    selected_chat: &mut String,
+) -> bool {
+    match command {
+        StorageCommand::Select(chat_id) => {
+            *selected_chat = chat_id;
+            true
+        }
+        StorageCommand::AddMessage(message, unread, reply) => {
+            let _ = reply.send(database.add_message(message, unread));
+            true
+        }
+        StorageCommand::AddChat(chat) => {
+            database.add_chat(chat);
+            true
+        }
+        StorageCommand::ResolveContact {
+            id,
+            fallback,
+            push_name,
+            reply,
+        } => {
+            if !push_name.is_empty() {
+                database.update_push_name(&id, "", &push_name);
+            }
+            if database.get_contact(&id).is_none() {
+                database.add_contact(Contact {
+                    id: id.clone(),
+                    name: fallback.clone(),
+                    short: fallback,
+                });
+            }
+            let _ = reply.send((database.id_name(&id), database.id_short(&id)));
+            true
+        }
+        StorageCommand::UpdatePushName(id, old_name, new_name) => {
+            database.update_push_name(&id, &old_name, &new_name);
+            if id.ends_with(CONTACT_SUFFIX) {
+                database.add_chat(Chat {
+                    name: database.id_name(&id),
+                    id,
+                    ..Default::default()
+                });
+            }
+            true
+        }
+        StorageCommand::UpdatePushNames(names) => {
+            database.update_push_names(names);
+            true
+        }
+        StorageCommand::RefreshContactNames => {
+            database.refresh_contact_names();
+            true
+        }
+        StorageCommand::UpdateChatUnread(chat_id, unread) => {
+            database.update_chat_unread(&chat_id, unread);
+            true
+        }
+        StorageCommand::MarkChatRead(chat_id, reply) => {
+            let _ = reply.send(database.mark_chat_read(&chat_id));
+            true
+        }
+        StorageCommand::MarkMessageRevoked(id, reply) => {
+            let changed = database.mark_message_revoked(&id);
+            let _ = reply.send(changed);
+            changed
+        }
+        StorageCommand::Message(id, reply) => {
+            let _ = reply.send(database.message(&id).cloned());
+            false
+        }
+        StorageCommand::OldestMessage(chat_id, reply) => {
+            let _ = reply.send(database.oldest_message(&chat_id).cloned());
+            false
+        }
+        StorageCommand::MessageInfo(id, reply) => {
+            let _ = reply.send(database.message_info(&id));
+            false
+        }
+    }
+}
 
 #[derive(Default)]
 pub struct MessageDatabase {
@@ -492,5 +764,40 @@ mod tests {
         assert_eq!(chat.preview, "café amanhã");
         assert_eq!(chat.last_message_kind, MessageKind::Text);
         assert_eq!(chat.unread, 1);
+    }
+
+    #[tokio::test]
+    async fn storage_actor_coalesces_mutations_into_a_consistent_snapshot() {
+        let (ui_tx, mut ui_rx) = mpsc::channel(QUEUE_CAPACITY);
+        let (storage, task) = start_storage_actor(ui_tx);
+        let chat = "123@s.whatsapp.net";
+        storage.select(chat.into()).await.unwrap();
+        for index in 0..3 {
+            storage
+                .add_message(message(&format!("msg-{index}"), chat, index), false)
+                .await
+                .unwrap();
+        }
+
+        let snapshot = tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                if let Some(UiEvent::Snapshot(snapshot)) = ui_rx.recv().await
+                    && snapshot.revision >= 4
+                {
+                    break snapshot;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(snapshot.selected_chat, chat);
+        assert_eq!(snapshot.messages.len(), 3);
+        assert_eq!(snapshot.chats.len(), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(8), ui_rx.recv())
+                .await
+                .is_err()
+        );
+        task.abort();
     }
 }

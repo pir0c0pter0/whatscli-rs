@@ -15,7 +15,9 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::VERSION;
 use crate::config::Config;
-use crate::model::{Chat, ConnectionState, Message, MessageKind, SessionStatus};
+use crate::model::{
+    Chat, ConnectionState, Message, MessageKind, SessionStatus, TaskCategory, TaskInfo,
+};
 use crate::terminal_safe_text;
 use editor::{Editor, truncate_width, wrap_width};
 use theme::Theme;
@@ -304,7 +306,8 @@ pub struct ViewModel<'a> {
     pub selected_chat: &'a str,
     pub overlay: Option<&'a Overlay>,
     pub toast: Option<&'a Toast>,
-    pub loading_history: bool,
+    pub active_tasks: &'a [TaskInfo],
+    pub closing: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -515,6 +518,10 @@ fn render_chats(frame: &mut Frame<'_>, area: Rect, model: &ViewModel<'_>, mode: 
 }
 
 fn render_thread(frame: &mut Frame<'_>, area: Rect, model: &ViewModel<'_>) {
+    let loading_history = model
+        .active_tasks
+        .iter()
+        .any(|task| task.category == TaskCategory::History);
     let block = Block::new()
         .padding(Padding::horizontal(1))
         .style(Style::new().bg(model.theme.background));
@@ -524,7 +531,7 @@ fn render_thread(frame: &mut Frame<'_>, area: Rect, model: &ViewModel<'_>) {
         render_empty(frame, inner, model);
         return;
     }
-    if model.messages.is_empty() && !model.loading_history {
+    if model.messages.is_empty() && !loading_history {
         frame.render_widget(
             Paragraph::new(Text::from(vec![
                 Line::styled(
@@ -545,7 +552,7 @@ fn render_thread(frame: &mut Frame<'_>, area: Rect, model: &ViewModel<'_>) {
     let first_unread = model.messages.iter().position(|message| message.unread);
     let mut selected_item = 0;
     let mut items = Vec::new();
-    if model.loading_history {
+    if loading_history {
         items.push(ListItem::new(Text::from(vec![
             Line::styled(
                 "░░░ loading older messages",
@@ -764,11 +771,28 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &ViewModel<'_>, mode:
         Focus::Messages => " ↑↓ select  ·  i info  ·  d download  ·  Esc composer ",
     };
     let narrow = mode == LayoutMode::Narrow;
-    let value = if narrow {
+    let hints = if narrow {
         hints.replace("  ·  ", " · ")
     } else {
         hints.to_owned()
     };
+    let task = if model.closing {
+        Some("◌ closing".to_owned())
+    } else {
+        model.active_tasks.last().map(|latest| {
+            let additional = model.active_tasks.len().saturating_sub(1);
+            format!(
+                "◌ {}{}",
+                latest.label,
+                if additional == 0 {
+                    String::new()
+                } else {
+                    format!(" +{additional}")
+                }
+            )
+        })
+    };
+    let value = task.map_or(hints.clone(), |task| format!(" {task}  · {hints}"));
     frame.render_widget(
         Paragraph::new(truncate_width(&value, area.width as usize)).style(
             Style::new()

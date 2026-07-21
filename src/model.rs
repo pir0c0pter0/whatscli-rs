@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use whatsapp_rust::waproto::whatsapp as wa;
 
@@ -119,30 +120,135 @@ impl SessionStatus {
     }
 }
 
-#[derive(Debug, Clone)]
+static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TaskCategory {
+    Session,
+    Conversation,
+    History,
+    Transfer,
+    Integration,
+}
+
+impl TaskCategory {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::Conversation => "conversation",
+            Self::History => "history",
+            Self::Transfer => "transfer",
+            Self::Integration => "system",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Command {
+    pub id: u64,
+    pub category: TaskCategory,
     pub name: String,
     pub params: Vec<String>,
 }
 
 impl Command {
     pub fn new(name: impl Into<String>, params: Vec<String>) -> Self {
+        let name = name.into();
         Self {
-            name: name.into(),
+            id: NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed),
+            category: classify_command(&name),
+            name,
             params,
         }
     }
+
+    pub fn label(&self) -> String {
+        match self.name.as_str() {
+            "send" => "sending message".into(),
+            "backlog" | "more" => "syncing history".into(),
+            "download" => "downloading media".into(),
+            "open" => "opening media".into(),
+            "show" => "rendering preview".into(),
+            "clipboard-copy" => "copying to clipboard".into(),
+            "clipboard-paste" => "reading clipboard".into(),
+            name => name.replace('-', " "),
+        }
+    }
+}
+
+pub fn classify_command(name: &str) -> TaskCategory {
+    match name {
+        "connect" | "login" | "disconnect" | "logout" | "reset" | "select" | "colorlist" => {
+            TaskCategory::Session
+        }
+        "backlog" | "more" => TaskCategory::History,
+        "download" | "open" | "show" => TaskCategory::Transfer,
+        "url" | "clipboard-copy" | "clipboard-paste" => TaskCategory::Integration,
+        _ => TaskCategory::Conversation,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskInfo {
+    pub id: u64,
+    pub category: TaskCategory,
+    pub label: String,
+}
+
+impl From<&Command> for TaskInfo {
+    fn from(command: &Command) -> Self {
+        Self {
+            id: command.id,
+            category: command.category,
+            label: command.label(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DatabaseSnapshot {
+    pub revision: u64,
+    pub selected_chat: String,
+    pub chats: Vec<Chat>,
+    pub messages: Vec<Message>,
 }
 
 #[derive(Debug, Clone)]
 pub enum UiEvent {
     Status(SessionStatus),
-    Message(Box<Message>),
-    Refresh,
+    Snapshot(DatabaseSnapshot),
+    TaskStarted(TaskInfo),
+    TaskCompleted(TaskInfo),
+    TaskFailed { task: TaskInfo, error: String },
+    QueueSaturated(TaskCategory),
+    ClipboardText(String),
+    Preview(String),
     Text(String),
     ColorList,
     Error(String),
     Qr { code: String, expires_in: u64 },
-    Open(String),
-    ShowImage(String),
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+
+    #[test]
+    fn commands_are_classified_for_independent_workers() {
+        assert_eq!(classify_command("connect"), TaskCategory::Session);
+        assert_eq!(classify_command("send"), TaskCategory::Conversation);
+        assert_eq!(classify_command("backlog"), TaskCategory::History);
+        assert_eq!(classify_command("download"), TaskCategory::Transfer);
+        assert_eq!(
+            classify_command("clipboard-paste"),
+            TaskCategory::Integration
+        );
+    }
+
+    #[test]
+    fn command_ids_are_unique() {
+        let first = Command::new("connect", Vec::new());
+        let second = Command::new("connect", Vec::new());
+        assert_ne!(first.id, second.id);
+    }
 }

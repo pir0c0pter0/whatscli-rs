@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{TimeZone, Utc};
 use regex::Regex;
-use tokio::sync::{Mutex, RwLock, mpsc};
-use whatsapp_rust::bot::Bot;
+use tokio::sync::{RwLock, Semaphore, mpsc, watch};
+use tokio::task::{JoinHandle, JoinSet};
+use whatsapp_rust::bot::{Bot, BotHandle};
 use whatsapp_rust::download::MediaType;
 use whatsapp_rust::proto_helpers::MessageExt;
 use whatsapp_rust::store::SqliteStore;
@@ -24,38 +26,102 @@ use whatsapp_rust::{
 
 use crate::config::Config;
 use crate::model::{
-    Chat, Command, ConnectionState, Contact, GROUP_SUFFIX, Message, MessageKind, SessionStatus,
-    UiEvent,
+    Chat, Command, ConnectionState, GROUP_SUFFIX, Message, MessageKind, SessionStatus,
+    TaskCategory, TaskInfo, UiEvent,
 };
 use crate::qr;
-use crate::storage::MessageDatabase;
+use crate::storage::{QUEUE_CAPACITY, StorageHandle, start_storage_actor};
 
+const TRANSFER_LIMIT: usize = 2;
+
+pub struct BackgroundRuntime {
+    pub commands: mpsc::Sender<Command>,
+    pub events: mpsc::Receiver<UiEvent>,
+    handle: BackgroundHandle,
+}
+
+pub struct BackgroundHandle {
+    shutdown_tx: watch::Sender<bool>,
+    supervisor: JoinHandle<()>,
+}
+
+impl BackgroundRuntime {
+    pub fn into_parts(
+        self,
+    ) -> (
+        mpsc::Sender<Command>,
+        mpsc::Receiver<UiEvent>,
+        BackgroundHandle,
+    ) {
+        (self.commands, self.events, self.handle)
+    }
+}
+
+impl BackgroundHandle {
+    pub async fn shutdown(self) {
+        self.shutdown_with_timeout(Duration::from_secs(3)).await;
+    }
+
+    async fn shutdown_with_timeout(self, timeout: Duration) -> bool {
+        let _ = self.shutdown_tx.send(true);
+        let mut supervisor = self.supervisor;
+        if tokio::time::timeout(timeout, &mut supervisor)
+            .await
+            .is_err()
+        {
+            supervisor.abort();
+            let _ = supervisor.await;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct SessionManager {
-    pub db: Arc<Mutex<MessageDatabase>>,
+    storage: StorageHandle,
     current_receiver: Arc<RwLock<String>>,
     client: Arc<Client>,
-    command_rx: mpsc::UnboundedReceiver<Command>,
-    ui_tx: mpsc::UnboundedSender<UiEvent>,
+    ui_tx: mpsc::Sender<UiEvent>,
     config: Arc<Config>,
 }
 
-impl SessionManager {
-    pub async fn start(
-        config: Arc<Config>,
-    ) -> Result<(
-        mpsc::UnboundedSender<Command>,
-        mpsc::UnboundedReceiver<UiEvent>,
-        Arc<Mutex<MessageDatabase>>,
-    )> {
-        let (command_tx, command_rx) = mpsc::unbounded_channel();
-        let (ui_tx, ui_rx) = mpsc::unbounded_channel();
-        let _ = ui_tx.send(UiEvent::Status(SessionStatus {
-            state: ConnectionState::Connecting,
-            last_seen: String::new(),
-        }));
-        let db = Arc::new(Mutex::new(MessageDatabase::default()));
-        let current_receiver = Arc::new(RwLock::new(String::new()));
+enum IntegrationWork {
+    Command(Command),
+    Notification {
+        task: TaskInfo,
+        title: String,
+        message: String,
+    },
+}
 
+enum HistoryWork {
+    Command(Command),
+    Protocol(Arc<Event>),
+}
+
+impl SessionManager {
+    pub fn start(config: Arc<Config>) -> BackgroundRuntime {
+        let (command_tx, command_rx) = mpsc::channel(QUEUE_CAPACITY);
+        let (ui_tx, ui_rx) = mpsc::channel(QUEUE_CAPACITY);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let supervisor = tokio::spawn(supervise(config, command_rx, ui_tx, shutdown_rx));
+        BackgroundRuntime {
+            commands: command_tx,
+            events: ui_rx,
+            handle: BackgroundHandle {
+                shutdown_tx,
+                supervisor,
+            },
+        }
+    }
+
+    async fn initialize(
+        config: Arc<Config>,
+        protocol_tx: mpsc::Sender<Arc<Event>>,
+        ui_tx: mpsc::Sender<UiEvent>,
+    ) -> Result<(Arc<Client>, BotHandle)> {
         finish_pending_session_reset(&config.session_file).await?;
         let session_path = config.session_file.to_string_lossy();
         let store = Arc::new(SqliteStore::new(&session_path).await.with_context(|| {
@@ -64,25 +130,20 @@ impl SessionManager {
                 config.session_file.display()
             )
         })?);
-        let event_db = Arc::clone(&db);
-        let event_current = Arc::clone(&current_receiver);
         let event_tx = ui_tx.clone();
-        let event_config = Arc::clone(&config);
         let mut bot = Bot::builder()
             .with_backend(store)
             .with_transport_factory(TokioWebSocketTransportFactory::new())
             .with_http_client(UreqHttpClient::new())
             .with_runtime(TokioRuntime)
-            .on_event(move |event, client| {
-                let db = Arc::clone(&event_db);
-                let current = Arc::clone(&event_current);
+            .on_event(move |event, _client| {
                 let tx = event_tx.clone();
-                let config = Arc::clone(&event_config);
+                let protocol = protocol_tx.clone();
                 async move {
-                    if let Err(error) =
-                        handle_event(event, client, db, current, tx.clone(), config).await
-                    {
-                        let _ = tx.send(UiEvent::Error(error.to_string()));
+                    if protocol.try_send(event).is_err() {
+                        let _ = tx
+                            .send(UiEvent::QueueSaturated(TaskCategory::Session))
+                            .await;
                     }
                 }
             })
@@ -90,42 +151,7 @@ impl SessionManager {
             .await?;
         let client = bot.client();
         let handle = bot.run().await?;
-        let ended_tx = ui_tx.clone();
-        tokio::spawn(async move {
-            let result = handle.await;
-            if let Err(error) = result {
-                let _ = ended_tx.send(UiEvent::Error(format!(
-                    "WhatsApp connection task stopped: {error}"
-                )));
-            }
-            let _ = ended_tx.send(UiEvent::Status(SessionStatus::default()));
-        });
-
-        let mut manager = Self {
-            db: Arc::clone(&db),
-            current_receiver,
-            client,
-            command_rx,
-            ui_tx,
-            config,
-        };
-        tokio::spawn(async move {
-            manager.run().await;
-        });
-        Ok((command_tx, ui_rx, db))
-    }
-
-    async fn run(&mut self) {
-        while let Some(command) = self.command_rx.recv().await {
-            let was_connect = matches!(command.name.as_str(), "connect" | "login");
-            if let Err(error) = self.execute(command).await {
-                if was_connect {
-                    let _ = self.ui_tx.send(UiEvent::Status(SessionStatus::default()));
-                }
-                let _ = self.ui_tx.send(UiEvent::Error(error.to_string()));
-            }
-        }
-        self.client.disconnect().await;
+        Ok((client, handle))
     }
 
     async fn execute(&self, command: Command) -> Result<()> {
@@ -133,22 +159,25 @@ impl SessionManager {
             "select" => {
                 let id = require_param(&command, 0)?;
                 *self.current_receiver.write().await = id.to_owned();
-                let _ = self.ui_tx.send(UiEvent::Refresh);
+                self.storage.select(id.to_owned()).await?;
             }
             "connect" | "login" => {
                 if !self.client.is_connected() {
-                    let _ = self.ui_tx.send(UiEvent::Status(SessionStatus {
-                        state: ConnectionState::Connecting,
-                        last_seen: String::new(),
-                    }));
+                    let _ = self
+                        .ui_tx
+                        .send(UiEvent::Status(SessionStatus {
+                            state: ConnectionState::Connecting,
+                            last_seen: String::new(),
+                        }))
+                        .await;
                     self.client.connect().await?;
                 }
-                self.text("Successfully connected to WhatsApp");
+                self.text("Successfully connected to WhatsApp").await;
             }
             "disconnect" => self.client.disconnect().await,
             "logout" => {
                 self.client.logout().await?;
-                self.text("Successfully logged out");
+                self.text("Successfully logged out").await;
             }
             "reset" => self.reset_session().await?,
             "send" => {
@@ -163,7 +192,8 @@ impl SessionManager {
             "backlog" | "more" => self.load_backlog().await?,
             "info" => {
                 let id = require_param(&command, 0)?;
-                self.text(self.db.lock().await.message_info(id));
+                self.text(self.storage.message_info(id.to_owned()).await?)
+                    .await;
             }
             "download" => self.download_command(&command, false, false).await?,
             "open" => self.download_command(&command, true, false).await?,
@@ -189,7 +219,7 @@ impl SessionManager {
             "leave" => {
                 let group = self.current_group().await?;
                 self.client.groups().leave(&group).await?;
-                self.text(format!("left group {group}"));
+                self.text(format!("left group {group}")).await;
             }
             "create" => self.create_group(&command).await?,
             "add" | "remove" | "admin" | "removeadmin" => {
@@ -197,15 +227,17 @@ impl SessionManager {
             }
             "subject" => self.update_subject(&command).await?,
             "colorlist" => {
-                let _ = self.ui_tx.send(UiEvent::ColorList);
+                let _ = self.ui_tx.send(UiEvent::ColorList).await;
             }
+            "clipboard-copy" => self.copy_to_clipboard(&command).await?,
+            "clipboard-paste" => self.paste_from_clipboard().await?,
             other => bail!("Unknown command: {other}"),
         }
         Ok(())
     }
 
-    fn text(&self, text: impl Into<String>) {
-        let _ = self.ui_tx.send(UiEvent::Text(text.into()));
+    async fn text(&self, text: impl Into<String>) {
+        let _ = self.ui_tx.send(UiEvent::Text(text.into())).await;
     }
 
     async fn reset_session(&self) -> Result<()> {
@@ -229,7 +261,8 @@ impl SessionManager {
             "Session reset scheduled. Restart whatscli to pair with a new QR code."
         } else {
             "Session reset. Restart whatscli to pair with a new QR code."
-        });
+        })
+        .await;
         Ok(())
     }
 
@@ -257,14 +290,17 @@ impl SessionManager {
         } else {
             chat_id.to_owned()
         };
-        let mut db = self.db.lock().await;
+        let (contact_name, contact_short) = self
+            .storage
+            .resolve_contact(contact_id.clone(), contact_id.clone(), String::new())
+            .await?;
         let msg = Message {
             id: response.message_id,
             chat_id: chat_id.into(),
             sender_id: own,
             contact_id: contact_id.clone(),
-            contact_name: db.id_name(&contact_id),
-            contact_short: db.id_short(&contact_id),
+            contact_name,
+            contact_short,
             timestamp: Utc::now().timestamp().max(0) as u64,
             from_me: true,
             text: text.into(),
@@ -275,9 +311,7 @@ impl SessionManager {
             })),
             ..Default::default()
         };
-        db.add_message(msg.clone(), false);
-        drop(db);
-        let _ = self.ui_tx.send(UiEvent::Message(Box::new(msg)));
+        self.storage.add_message(msg, false).await?;
         Ok(())
     }
 
@@ -287,10 +321,10 @@ impl SessionManager {
         if chat_id.is_empty() {
             bail!("Usage: backlog -> only works in a chat");
         }
-        let oldest = self.db.lock().await.oldest_message(&chat_id).cloned()
+        let oldest = self.storage.oldest_message(chat_id.clone()).await?
             .ok_or_else(|| anyhow!("No local message anchor found yet. Wait for history sync, then try /backlog again."))?;
         let jid: Jid = chat_id.parse().context("invalid JID")?;
-        self.text("Retrieving message history...");
+        self.text("Retrieving message history...").await;
         self.client
             .fetch_message_history(
                 &jid,
@@ -300,7 +334,8 @@ impl SessionManager {
                 self.config.general.backlog_msg_quantity,
             )
             .await?;
-        self.text("Requested older messages from WhatsApp. Waiting for sync response.");
+        self.text("Requested older messages from WhatsApp. Waiting for sync response.")
+            .await;
         Ok(())
     }
 
@@ -311,9 +346,9 @@ impl SessionManager {
             bail!("Usage: read -> only works in a chat");
         }
         let chat: Jid = chat_id.parse().context("invalid JID")?;
-        let cleared = self.db.lock().await.mark_chat_read(&chat_id);
+        let cleared = self.storage.mark_chat_read(chat_id.clone()).await?;
         if cleared.is_empty() {
-            self.text("No unread messages in current chat");
+            self.text("No unread messages in current chat").await;
             return Ok(());
         }
         let mut batches: HashMap<String, Vec<String>> = HashMap::new();
@@ -335,33 +370,28 @@ impl SessionManager {
                 .mark_as_read(&chat, sender_jid.as_ref(), ids)
                 .await?;
         }
-        let _ = self.ui_tx.send(UiEvent::Refresh);
         Ok(())
     }
 
     async fn download_command(&self, command: &Command, preview: bool, show: bool) -> Result<()> {
         let id = require_param(command, 0)?;
         let msg = self
-            .db
-            .lock()
-            .await
-            .message(id)
-            .cloned()
+            .storage
+            .message(id.to_owned())
+            .await?
             .ok_or_else(|| anyhow!("message not found"))?;
         if show && msg.kind != MessageKind::Image {
             bail!("show only works for image messages");
         }
         let path = self.download_message(&msg, preview).await?;
         if show {
-            let _ = self
-                .ui_tx
-                .send(UiEvent::ShowImage(path.to_string_lossy().into()));
+            self.show_image(path).await?;
         } else if preview {
-            let _ = self
-                .ui_tx
-                .send(UiEvent::Open(path.to_string_lossy().into()));
+            self.open_target(path.to_string_lossy().into_owned())
+                .await?;
+            self.text("Opened with the system application").await;
         } else {
-            self.text(format!("-> {}", path.display()));
+            self.text(format!("-> {}", path.display())).await;
         }
         Ok(())
     }
@@ -380,7 +410,7 @@ impl SessionManager {
         };
         tokio::fs::create_dir_all(base_dir).await?;
         let path = base_dir.join(download_file_name(msg));
-        if path.exists() {
+        if tokio::fs::try_exists(&path).await? {
             return Ok(path);
         }
         let data = match msg.kind {
@@ -429,16 +459,18 @@ impl SessionManager {
     async fn open_url(&self, command: &Command) -> Result<()> {
         let id = require_param(command, 0)?;
         let text = self
-            .db
-            .lock()
-            .await
-            .message(id)
+            .storage
+            .message(id.to_owned())
+            .await?
             .map(|m| m.text.clone())
             .ok_or_else(|| anyhow!("message not found"))?;
         let url = Regex::new(r"https?://[^\s]+")?
             .find(&text)
-            .ok_or_else(|| anyhow!("No URL found in message"))?;
-        let _ = self.ui_tx.send(UiEvent::Open(url.as_str().into()));
+            .ok_or_else(|| anyhow!("No URL found in message"))?
+            .as_str()
+            .to_owned();
+        self.open_target(url).await?;
+        self.text("Opened URL with the system application").await;
         Ok(())
     }
 
@@ -485,14 +517,17 @@ impl SessionManager {
         } else {
             chat_id.to_owned()
         };
-        let mut db = self.db.lock().await;
+        let (contact_name, contact_short) = self
+            .storage
+            .resolve_contact(contact_id.clone(), contact_id.clone(), String::new())
+            .await?;
         let msg = Message {
             id: response.message_id,
             chat_id: chat_id.into(),
             sender_id: own,
             contact_id: contact_id.clone(),
-            contact_name: db.id_name(&contact_id),
-            contact_short: db.id_short(&contact_id),
+            contact_name,
+            contact_short,
             timestamp: Utc::now().timestamp().max(0) as u64,
             from_me: true,
             text: media_display_text(kind, &file_name, ""),
@@ -502,9 +537,7 @@ impl SessionManager {
             raw_message: Some(Arc::new(raw)),
             ..Default::default()
         };
-        db.add_message(msg.clone(), false);
-        drop(db);
-        let _ = self.ui_tx.send(UiEvent::Message(Box::new(msg)));
+        self.storage.add_message(msg, false).await?;
         Ok(())
     }
 
@@ -512,11 +545,9 @@ impl SessionManager {
         ensure_connected(&self.client)?;
         let id = require_param(command, 0)?;
         let msg = self
-            .db
-            .lock()
-            .await
-            .message(id)
-            .cloned()
+            .storage
+            .message(id.to_owned())
+            .await?
             .ok_or_else(|| anyhow!("message not found"))?;
         let chat: Jid = msg.chat_id.parse()?;
         let revoke_type = if msg.from_me {
@@ -529,9 +560,8 @@ impl SessionManager {
         self.client
             .revoke_message(chat, msg.id.clone(), revoke_type)
             .await?;
-        self.db.lock().await.mark_message_revoked(&msg.id);
-        let _ = self.ui_tx.send(UiEvent::Refresh);
-        self.text(format!("revoked: {}", msg.id));
+        self.storage.mark_message_revoked(msg.id.clone()).await?;
+        self.text(format!("revoked: {}", msg.id)).await;
         Ok(())
     }
 
@@ -564,9 +594,8 @@ impl SessionManager {
             last_message: Utc::now().timestamp(),
             ..Default::default()
         };
-        self.db.lock().await.add_chat(chat.clone());
-        let _ = self.ui_tx.send(UiEvent::Refresh);
-        self.text(format!("created new group {}", chat.id));
+        self.storage.add_chat(chat.clone()).await?;
+        self.text(format!("created new group {}", chat.id)).await;
         Ok(())
     }
 
@@ -607,7 +636,7 @@ impl SessionManager {
             }
             _ => unreachable!(),
         }
-        self.text(format!("updated members for {group}"));
+        self.text(format!("updated members for {group}")).await;
         Ok(())
     }
 
@@ -621,123 +650,486 @@ impl SessionManager {
             .groups()
             .set_subject(&group, GroupSubject::new(subject.clone())?)
             .await?;
-        self.db.lock().await.add_chat(Chat {
-            id: group.to_string(),
-            is_group: true,
-            name: subject,
-            ..Default::default()
-        });
-        let _ = self.ui_tx.send(UiEvent::Refresh);
+        self.storage
+            .add_chat(Chat {
+                id: group.to_string(),
+                is_group: true,
+                name: subject,
+                ..Default::default()
+            })
+            .await?;
         Ok(())
+    }
+
+    async fn open_target(&self, target: String) -> Result<()> {
+        tokio::task::spawn_blocking(move || open::that(target))
+            .await
+            .context("system opener task failed")??;
+        Ok(())
+    }
+
+    async fn copy_to_clipboard(&self, command: &Command) -> Result<()> {
+        let value = require_param(command, 0)?.to_owned();
+        tokio::task::spawn_blocking(move || arboard::Clipboard::new()?.set_text(value))
+            .await
+            .context("clipboard task failed")??;
+        self.text("User ID copied").await;
+        Ok(())
+    }
+
+    async fn paste_from_clipboard(&self) -> Result<()> {
+        let text = tokio::task::spawn_blocking(move || arboard::Clipboard::new()?.get_text())
+            .await
+            .context("clipboard task failed")??;
+        let _ = self.ui_tx.send(UiEvent::ClipboardText(text)).await;
+        Ok(())
+    }
+
+    async fn show_image(&self, path: PathBuf) -> Result<()> {
+        let show_command = self.config.general.show_command.clone();
+        let output = tokio::task::spawn_blocking(move || -> Result<String> {
+            let mut parts = shell_words::split(&show_command).context("Invalid show_command")?;
+            if parts.is_empty() {
+                bail!("show_command is empty");
+            }
+            let program = parts.remove(0);
+            let output = std::process::Command::new(program)
+                .args(parts)
+                .arg(path)
+                .output()?;
+            if !output.status.success() {
+                bail!("{}", String::from_utf8_lossy(&output.stderr));
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        })
+        .await
+        .context("preview task failed")??;
+        let _ = self.ui_tx.send(UiEvent::Preview(output)).await;
+        Ok(())
+    }
+}
+
+async fn supervise(
+    config: Arc<Config>,
+    command_rx: mpsc::Receiver<Command>,
+    ui_tx: mpsc::Sender<UiEvent>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let _ = ui_tx
+        .send(UiEvent::Status(SessionStatus {
+            state: ConnectionState::Connecting,
+            last_seen: String::new(),
+        }))
+        .await;
+    let (storage, storage_task) = start_storage_actor(ui_tx.clone());
+    let (protocol_tx, protocol_rx) = mpsc::channel(QUEUE_CAPACITY);
+    let initialize_task = TaskInfo {
+        id: Command::new("initialize", Vec::new()).id,
+        category: TaskCategory::Session,
+        label: "initializing WhatsApp".into(),
+    };
+    let _ = ui_tx
+        .send(UiEvent::TaskStarted(initialize_task.clone()))
+        .await;
+    let initialization =
+        SessionManager::initialize(Arc::clone(&config), protocol_tx, ui_tx.clone());
+    let (client, connection_task) = tokio::select! {
+        _ = shutdown_rx.changed() => {
+            storage_task.abort();
+            return;
+        }
+        result = initialization => match result {
+            Ok(value) => {
+                let _ = ui_tx
+                    .send(UiEvent::TaskCompleted(initialize_task))
+                    .await;
+                value
+            }
+            Err(error) => {
+                let _ = ui_tx
+                    .send(UiEvent::TaskFailed {
+                        task: initialize_task,
+                        error: error.to_string(),
+                    })
+                    .await;
+                let _ = ui_tx.send(UiEvent::Status(SessionStatus::default())).await;
+                storage_task.abort();
+                return;
+            }
+        }
+    };
+    let context = SessionManager {
+        storage,
+        current_receiver: Arc::new(RwLock::new(String::new())),
+        client,
+        ui_tx,
+        config,
+    };
+    run_workers(
+        context,
+        command_rx,
+        protocol_rx,
+        connection_task,
+        shutdown_rx,
+    )
+    .await;
+    storage_task.abort();
+    let _ = storage_task.await;
+}
+
+async fn run_workers(
+    context: SessionManager,
+    command_rx: mpsc::Receiver<Command>,
+    protocol_rx: mpsc::Receiver<Arc<Event>>,
+    connection_task: BotHandle,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let (session_tx, session_rx) = mpsc::channel(QUEUE_CAPACITY);
+    let (history_tx, history_rx) = mpsc::channel(QUEUE_CAPACITY);
+    let (transfer_tx, transfer_rx) = mpsc::channel(QUEUE_CAPACITY);
+    let (integration_tx, integration_rx) = mpsc::channel(QUEUE_CAPACITY);
+    let mut workers = JoinSet::new();
+    workers.spawn(command_worker(context.clone(), session_rx));
+    workers.spawn(history_worker(context.clone(), history_rx));
+    workers.spawn(transfer_worker(context.clone(), transfer_rx));
+    workers.spawn(integration_worker(context.clone(), integration_rx));
+    workers.spawn(protocol_worker(
+        context.clone(),
+        protocol_rx,
+        history_tx.clone(),
+        integration_tx.clone(),
+        shutdown_rx.clone(),
+    ));
+    workers.spawn(connection_monitor(context.ui_tx.clone(), connection_task));
+    workers.spawn(command_router(
+        context.clone(),
+        command_rx,
+        session_tx,
+        history_tx,
+        transfer_tx,
+        integration_tx,
+        shutdown_rx.clone(),
+    ));
+
+    let _ = shutdown_rx.changed().await;
+    context.client.disconnect().await;
+    while workers.join_next().await.is_some() {}
+}
+
+async fn connection_monitor(ui_tx: mpsc::Sender<UiEvent>, task: BotHandle) {
+    match task.await {
+        Ok(()) => {}
+        Err(error) => {
+            let _ = ui_tx
+                .send(UiEvent::Error(format!(
+                    "WhatsApp connection task stopped: {error}"
+                )))
+                .await;
+        }
+    }
+    let _ = ui_tx.send(UiEvent::Status(SessionStatus::default())).await;
+}
+
+async fn command_router(
+    context: SessionManager,
+    mut rx: mpsc::Receiver<Command>,
+    session_tx: mpsc::Sender<Command>,
+    history_tx: mpsc::Sender<HistoryWork>,
+    transfer_tx: mpsc::Sender<Command>,
+    integration_tx: mpsc::Sender<IntegrationWork>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let mut conversations: HashMap<String, mpsc::Sender<Command>> = HashMap::new();
+    let mut conversation_workers = JoinSet::new();
+    let mut closing = false;
+    loop {
+        let command = if closing {
+            rx.recv().await
+        } else {
+            tokio::select! {
+                command = rx.recv() => command,
+                _ = shutdown_rx.changed() => {
+                    rx.close();
+                    closing = true;
+                    continue;
+                }
+            }
+        };
+        let Some(command) = command else { break };
+        let category = command.category;
+        let saturated = match category {
+            TaskCategory::Session => session_tx.try_send(command).is_err(),
+            TaskCategory::History => history_tx.try_send(HistoryWork::Command(command)).is_err(),
+            TaskCategory::Transfer => transfer_tx.try_send(command).is_err(),
+            TaskCategory::Integration => integration_tx
+                .try_send(IntegrationWork::Command(command))
+                .is_err(),
+            TaskCategory::Conversation => {
+                let key = conversation_key(&command, &context).await;
+                let tx = conversations.entry(key).or_insert_with(|| {
+                    let (tx, rx) = mpsc::channel(QUEUE_CAPACITY);
+                    conversation_workers.spawn(command_worker(context.clone(), rx));
+                    tx
+                });
+                tx.try_send(command).is_err()
+            }
+        };
+        if saturated {
+            let _ = context.ui_tx.send(UiEvent::QueueSaturated(category)).await;
+        }
+    }
+    drop(conversations);
+    while conversation_workers.join_next().await.is_some() {}
+}
+
+async fn conversation_key(command: &Command, context: &SessionManager) -> String {
+    if command.name == "send" {
+        return command.params.first().cloned().unwrap_or_default();
+    }
+    context.current_receiver.read().await.clone()
+}
+
+async fn command_worker(context: SessionManager, mut rx: mpsc::Receiver<Command>) {
+    while let Some(command) = rx.recv().await {
+        execute_task(&context, command).await;
+    }
+}
+
+async fn transfer_worker(context: SessionManager, mut rx: mpsc::Receiver<Command>) {
+    let permits = Arc::new(Semaphore::new(TRANSFER_LIMIT));
+    let mut running = JoinSet::new();
+    while let Some(command) = rx.recv().await {
+        let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
+            break;
+        };
+        let context = context.clone();
+        running.spawn(async move {
+            let _permit = permit;
+            execute_task(&context, command).await;
+        });
+        while running.try_join_next().is_some() {}
+    }
+    while running.join_next().await.is_some() {}
+}
+
+async fn integration_worker(context: SessionManager, mut rx: mpsc::Receiver<IntegrationWork>) {
+    let mut running = JoinSet::new();
+    while let Some(work) = rx.recv().await {
+        let context = context.clone();
+        running.spawn(async move {
+            match work {
+                IntegrationWork::Command(command) => execute_task(&context, command).await,
+                IntegrationWork::Notification {
+                    task,
+                    title,
+                    message,
+                } => {
+                    let _ = context.ui_tx.send(UiEvent::TaskStarted(task.clone())).await;
+                    let config = Arc::clone(&context.config);
+                    let result =
+                        tokio::task::spawn_blocking(move || notify(&config, &title, &message))
+                            .await
+                            .map_err(anyhow::Error::from)
+                            .and_then(|result| result);
+                    finish_task(&context.ui_tx, task, result).await;
+                }
+            }
+        });
+        while running.try_join_next().is_some() {}
+    }
+    while running.join_next().await.is_some() {}
+}
+
+async fn execute_task(context: &SessionManager, command: Command) {
+    let task = TaskInfo::from(&command);
+    let was_connect = matches!(command.name.as_str(), "connect" | "login");
+    let _ = context.ui_tx.send(UiEvent::TaskStarted(task.clone())).await;
+    let result = context.execute(command).await;
+    if was_connect && result.is_err() {
+        let _ = context
+            .ui_tx
+            .send(UiEvent::Status(SessionStatus::default()))
+            .await;
+    }
+    finish_task(&context.ui_tx, task, result).await;
+}
+
+async fn finish_task(ui_tx: &mpsc::Sender<UiEvent>, task: TaskInfo, result: Result<()>) {
+    let event = match result {
+        Ok(()) => UiEvent::TaskCompleted(task),
+        Err(error) => UiEvent::TaskFailed {
+            task,
+            error: error.to_string(),
+        },
+    };
+    let _ = ui_tx.send(event).await;
+}
+
+async fn protocol_worker(
+    context: SessionManager,
+    mut rx: mpsc::Receiver<Arc<Event>>,
+    history_tx: mpsc::Sender<HistoryWork>,
+    integration_tx: mpsc::Sender<IntegrationWork>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    loop {
+        let event = tokio::select! {
+            event = rx.recv() => event,
+            _ = shutdown_rx.changed() => break,
+        };
+        let Some(event) = event else { break };
+        if matches!(&*event, Event::HistorySync(_)) {
+            if history_tx.try_send(HistoryWork::Protocol(event)).is_err() {
+                let _ = context
+                    .ui_tx
+                    .send(UiEvent::QueueSaturated(TaskCategory::History))
+                    .await;
+            }
+            continue;
+        }
+        if let Err(error) = handle_event(event, &context, &integration_tx).await {
+            let _ = context.ui_tx.send(UiEvent::Error(error.to_string())).await;
+        }
+    }
+}
+
+async fn history_worker(context: SessionManager, mut rx: mpsc::Receiver<HistoryWork>) {
+    while let Some(work) = rx.recv().await {
+        match work {
+            HistoryWork::Command(command) => execute_task(&context, command).await,
+            HistoryWork::Protocol(event) => {
+                let Event::HistorySync(lazy) = &*event else {
+                    continue;
+                };
+                let command = Command::new("history-sync", Vec::new());
+                let task = TaskInfo {
+                    id: command.id,
+                    category: TaskCategory::History,
+                    label: "syncing history".into(),
+                };
+                let _ = context.ui_tx.send(UiEvent::TaskStarted(task.clone())).await;
+                let result = if let Some(history) = lazy.get() {
+                    handle_history(history, &context.client, &context.storage).await
+                } else {
+                    Ok(())
+                };
+                finish_task(&context.ui_tx, task, result).await;
+            }
+        }
     }
 }
 
 async fn handle_event(
     event: Arc<Event>,
-    client: Arc<Client>,
-    db: Arc<Mutex<MessageDatabase>>,
-    current: Arc<RwLock<String>>,
-    tx: mpsc::UnboundedSender<UiEvent>,
-    config: Arc<Config>,
+    context: &SessionManager,
+    integration_tx: &mpsc::Sender<IntegrationWork>,
 ) -> Result<()> {
+    let tx = &context.ui_tx;
     match &*event {
         Event::PairingQrCode { code, timeout } => {
             let rendered = qr::render(code)?;
-            let _ = tx.send(UiEvent::Status(SessionStatus {
-                state: ConnectionState::Pairing,
-                last_seen: String::new(),
-            }));
-            let _ = tx.send(UiEvent::Qr {
-                code: rendered,
-                expires_in: timeout.as_secs(),
-            });
+            let _ = tx
+                .send(UiEvent::Status(SessionStatus {
+                    state: ConnectionState::Pairing,
+                    last_seen: String::new(),
+                }))
+                .await;
+            let _ = tx
+                .send(UiEvent::Qr {
+                    code: rendered,
+                    expires_in: timeout.as_secs(),
+                })
+                .await;
         }
         Event::Connected(_) => {
-            let _ = tx.send(UiEvent::Status(SessionStatus {
-                state: ConnectionState::Connected,
-                last_seen: String::new(),
-            }));
-            load_groups(&client, &db).await;
-            let _ = tx.send(UiEvent::Refresh);
+            let _ = tx
+                .send(UiEvent::Status(SessionStatus {
+                    state: ConnectionState::Connected,
+                    last_seen: String::new(),
+                }))
+                .await;
+            load_groups(&context.client, &context.storage).await?;
         }
         Event::Disconnected(_) => {
-            let _ = tx.send(UiEvent::Status(SessionStatus::default()));
+            let _ = tx.send(UiEvent::Status(SessionStatus::default())).await;
         }
         Event::LoggedOut(info) => {
-            let _ = tx.send(UiEvent::Status(SessionStatus::default()));
-            let _ = tx.send(UiEvent::Text(format!("Logged out: {:?}", info.reason)));
+            let _ = tx.send(UiEvent::Status(SessionStatus::default())).await;
+            let _ = tx
+                .send(UiEvent::Text(format!("Logged out: {:?}", info.reason)))
+                .await;
         }
         Event::PushNameUpdate(update) => {
-            let id = update.jid.to_string();
-            let mut database = db.lock().await;
-            database.update_push_name(&id, &update.old_push_name, &update.new_push_name);
-            if id.ends_with("@s.whatsapp.net") {
-                let name = database
-                    .get_contact(&id)
-                    .map(|contact| contact.name.clone())
-                    .unwrap_or_else(|| update.new_push_name.clone());
-                database.add_chat(Chat {
-                    id,
-                    name,
-                    ..Default::default()
-                });
-            }
-            drop(database);
-            let _ = tx.send(UiEvent::Refresh);
+            context
+                .storage
+                .update_push_name(
+                    update.jid.to_string(),
+                    update.old_push_name.clone(),
+                    update.new_push_name.clone(),
+                )
+                .await?;
         }
         Event::Message(raw, info) => {
             if let Some(revoke_id) = revoked_message_id(raw) {
-                db.lock().await.mark_message_revoked(&revoke_id);
-                let _ = tx.send(UiEvent::Refresh);
-            } else if let Some(msg) = message_from_info(info, Arc::clone(raw), &db).await {
-                let selected = current.read().await.clone();
+                context.storage.mark_message_revoked(revoke_id).await?;
+            } else if let Some(msg) =
+                message_from_info(info, Arc::clone(raw), &context.storage).await
+            {
+                let selected = context.current_receiver.read().await.clone();
                 let mark_unread = !msg.from_me && msg.chat_id != selected;
-                let is_new = db.lock().await.add_message(msg.clone(), mark_unread);
-                if msg.chat_id == selected && is_new {
-                    let _ = tx.send(UiEvent::Message(Box::new(msg.clone())));
-                } else {
-                    let _ = tx.send(UiEvent::Refresh);
-                }
+                context
+                    .storage
+                    .add_message(msg.clone(), mark_unread)
+                    .await?;
                 if mark_unread && msg.timestamp + 30 > Utc::now().timestamp().max(0) as u64 {
-                    notify(&config, &msg.contact_short, &msg.text)?;
+                    let command = Command::new("notification", Vec::new());
+                    let work = IntegrationWork::Notification {
+                        task: TaskInfo {
+                            id: command.id,
+                            category: TaskCategory::Integration,
+                            label: "showing notification".into(),
+                        },
+                        title: msg.contact_short,
+                        message: msg.text,
+                    };
+                    if integration_tx.try_send(work).is_err() {
+                        let _ = tx
+                            .send(UiEvent::QueueSaturated(TaskCategory::Integration))
+                            .await;
+                    }
                 }
             }
-        }
-        Event::HistorySync(lazy) => {
-            if let Some(history) = lazy.get() {
-                handle_history(history, &client, &db).await;
-            }
-            let _ = tx.send(UiEvent::Refresh);
         }
         Event::GroupUpdate(_) | Event::ContactUpdate(_) | Event::ContactUpdated(_) => {
-            load_groups(&client, &db).await;
-            let _ = tx.send(UiEvent::Refresh);
+            load_groups(&context.client, &context.storage).await?;
         }
         _ => {}
     }
     Ok(())
 }
 
-async fn load_groups(client: &Arc<Client>, db: &Arc<Mutex<MessageDatabase>>) {
+async fn load_groups(client: &Arc<Client>, storage: &StorageHandle) -> Result<()> {
     let Ok(groups) = client.groups().get_participating().await else {
-        return;
+        return Ok(());
     };
-    let mut db = db.lock().await;
     for (jid, group) in groups {
-        db.add_chat(Chat {
-            id: jid.to_string(),
-            is_group: true,
-            name: group.subject,
-            ..Default::default()
-        });
+        storage
+            .add_chat(Chat {
+                id: jid.to_string(),
+                is_group: true,
+                name: group.subject,
+                ..Default::default()
+            })
+            .await?;
     }
+    Ok(())
 }
 
 async fn handle_history(
     history: &wa::HistorySync,
     client: &Arc<Client>,
-    db: &Arc<Mutex<MessageDatabase>>,
-) {
+    storage: &StorageHandle,
+) -> Result<()> {
     let mut names = HashMap::new();
     for push in &history.pushnames {
         if let (Some(id), Some(name)) = (&push.id, &push.pushname)
@@ -747,22 +1139,20 @@ async fn handle_history(
             names.insert(id.clone(), name.clone());
         }
     }
-    {
-        let mut database = db.lock().await;
-        database.update_push_names(names.clone());
-        for id in names.keys().filter(|id| id.ends_with("@s.whatsapp.net")) {
-            let name = database
-                .get_contact(id)
-                .map(|contact| contact.name.clone())
-                .unwrap_or_else(|| names[id].clone());
-            database.add_chat(Chat {
+    storage.update_push_names(names.clone()).await?;
+    for id in names.keys().filter(|id| id.ends_with("@s.whatsapp.net")) {
+        let (name, _) = storage
+            .resolve_contact(id.clone(), names[id].clone(), names[id].clone())
+            .await?;
+        storage
+            .add_chat(Chat {
                 id: id.clone(),
                 name,
                 ..Default::default()
-            });
-        }
-        database.refresh_contact_names();
+            })
+            .await?;
     }
+    storage.refresh_contact_names().await?;
     for conversation in &history.conversations {
         let chat_id = if conversation.id.is_empty() {
             conversation.new_jid.clone().unwrap_or_default()
@@ -778,17 +1168,19 @@ async fn handle_history(
             .filter(|s| !s.is_empty())
             .or_else(|| conversation.display_name.clone().filter(|s| !s.is_empty()))
             .unwrap_or_else(|| chat_id.split('@').next().unwrap_or(&chat_id).to_owned());
-        db.lock().await.add_chat(Chat {
-            id: chat_id.clone(),
-            is_group: chat_id.ends_with(GROUP_SUFFIX),
-            name,
-            unread: conversation.unread_count.unwrap_or(0) as usize,
-            last_message: conversation
-                .last_msg_timestamp
-                .or(conversation.conversation_timestamp)
-                .unwrap_or(0) as i64,
-            ..Default::default()
-        });
+        storage
+            .add_chat(Chat {
+                id: chat_id.clone(),
+                is_group: chat_id.ends_with(GROUP_SUFFIX),
+                name,
+                unread: conversation.unread_count.unwrap_or(0) as usize,
+                last_message: conversation
+                    .last_msg_timestamp
+                    .or(conversation.conversation_timestamp)
+                    .unwrap_or(0) as i64,
+                ..Default::default()
+            })
+            .await?;
         for historical in &conversation.messages {
             let Some(web) = &historical.message else {
                 continue;
@@ -797,14 +1189,15 @@ async fn handle_history(
             let Some(info) = history_message_info(web, &chat_jid, client).await else {
                 continue;
             };
-            if let Some(message) = message_from_info(&info, Arc::new(raw.clone()), db).await {
-                db.lock().await.add_message(message, false);
+            if let Some(message) = message_from_info(&info, Arc::new(raw.clone()), storage).await {
+                storage.add_message(message, false).await?;
             }
         }
-        db.lock()
-            .await
-            .update_chat_unread(&chat_id, conversation.unread_count.unwrap_or(0) as usize);
+        storage
+            .update_chat_unread(chat_id, conversation.unread_count.unwrap_or(0) as usize)
+            .await?;
     }
+    Ok(())
 }
 
 async fn history_message_info(
@@ -853,7 +1246,7 @@ async fn history_message_info(
 async fn message_from_info(
     info: &MessageInfo,
     raw: Arc<wa::Message>,
-    db: &Arc<Mutex<MessageDatabase>>,
+    storage: &StorageHandle,
 ) -> Option<Message> {
     let base = raw.get_base_message();
     let chat_id = info.source.chat.to_string();
@@ -871,34 +1264,23 @@ async fn message_from_info(
         &contact_id,
     ])
     .to_owned();
-    {
-        let mut db = db.lock().await;
-        if !info.push_name.is_empty() {
-            db.update_push_name(&contact_id, "", &info.push_name);
-        }
-        if db.get_contact(&contact_id).is_none() {
-            db.add_contact(Contact {
-                id: contact_id.clone(),
-                name: fallback.clone(),
-                short: fallback,
-            });
-        }
-    }
-    let db_guard = db.lock().await;
+    let (contact_name, contact_short) = storage
+        .resolve_contact(contact_id.clone(), fallback, info.push_name.clone())
+        .await
+        .ok()?;
     let mut msg = Message {
         id: info.id.clone(),
         chat_id,
         sender_id: info.source.sender.to_string(),
         contact_id: contact_id.clone(),
-        contact_name: db_guard.id_name(&contact_id),
-        contact_short: db_guard.id_short(&contact_id),
+        contact_name,
+        contact_short,
         timestamp: info.timestamp.timestamp().max(0) as u64,
         from_me: info.source.is_from_me,
         forwarded: is_forwarded(base),
         raw_message: Some(raw.clone()),
         ..Default::default()
     };
-    drop(db_guard);
     if let Some(text) = raw.text_content() {
         msg.kind = MessageKind::Text;
         msg.text = text.into();
@@ -1185,6 +1567,7 @@ fn notify(config: &Config, title: &str, message: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn download_name_sanitizes_unix_traversal() {
@@ -1251,5 +1634,112 @@ mod tests {
             reset_marker(Path::new("/config/session-rust.db")),
             PathBuf::from("/config/session-rust.db.reset")
         );
+    }
+
+    #[tokio::test]
+    async fn background_shutdown_waits_for_a_normal_stop() {
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let supervisor = tokio::spawn(async move {
+            let _ = shutdown_rx.changed().await;
+        });
+        let timed_out = BackgroundHandle {
+            shutdown_tx,
+            supervisor,
+        }
+        .shutdown_with_timeout(Duration::from_millis(100))
+        .await;
+        assert!(!timed_out);
+    }
+
+    #[tokio::test]
+    async fn background_shutdown_cancels_a_stuck_supervisor_after_timeout() {
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+        let supervisor = tokio::spawn(std::future::pending());
+        let timed_out = BackgroundHandle {
+            shutdown_tx,
+            supervisor,
+        }
+        .shutdown_with_timeout(Duration::from_millis(10))
+        .await;
+        assert!(timed_out);
+    }
+
+    #[tokio::test]
+    async fn transfer_semaphore_never_allows_more_than_two_jobs() {
+        let permits = Arc::new(Semaphore::new(TRANSFER_LIMIT));
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let mut jobs = JoinSet::new();
+        for _ in 0..8 {
+            let permits = Arc::clone(&permits);
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
+            jobs.spawn(async move {
+                let _permit = permits.acquire_owned().await.unwrap();
+                let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(count, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+        while jobs.join_next().await.is_some() {}
+        assert_eq!(maximum.load(Ordering::SeqCst), TRANSFER_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn bounded_session_lane_processes_commands_in_fifo_order() {
+        let (tx, mut rx) = mpsc::channel(QUEUE_CAPACITY);
+        let worker = tokio::spawn(async move {
+            let mut order = Vec::new();
+            while let Some(value) = rx.recv().await {
+                order.push(value);
+            }
+            order
+        });
+        for value in ["connect", "logout", "reset"] {
+            tx.send(value).await.unwrap();
+        }
+        drop(tx);
+        assert_eq!(worker.await.unwrap(), ["connect", "logout", "reset"]);
+    }
+
+    #[tokio::test]
+    async fn conversation_lanes_keep_local_order_while_other_chats_progress() {
+        let (chat_a_tx, mut chat_a_rx) = mpsc::channel(QUEUE_CAPACITY);
+        let (chat_b_tx, mut chat_b_rx) = mpsc::channel(QUEUE_CAPACITY);
+        let (events_tx, mut events_rx) = mpsc::channel(QUEUE_CAPACITY);
+        let (a_started_tx, a_started_rx) = tokio::sync::oneshot::channel();
+        let release_a = Arc::new(tokio::sync::Notify::new());
+
+        let a_events = events_tx.clone();
+        let a_release = Arc::clone(&release_a);
+        let chat_a = tokio::spawn(async move {
+            let first = chat_a_rx.recv().await.unwrap();
+            let _ = a_started_tx.send(());
+            a_release.notified().await;
+            a_events.send(first).await.unwrap();
+            a_events
+                .send(chat_a_rx.recv().await.unwrap())
+                .await
+                .unwrap();
+        });
+        let b_events = events_tx;
+        let chat_b = tokio::spawn(async move {
+            b_events
+                .send(chat_b_rx.recv().await.unwrap())
+                .await
+                .unwrap();
+        });
+
+        chat_a_tx.send("a-1").await.unwrap();
+        chat_a_tx.send("a-2").await.unwrap();
+        a_started_rx.await.unwrap();
+        chat_b_tx.send("b-1").await.unwrap();
+        assert_eq!(events_rx.recv().await, Some("b-1"));
+        release_a.notify_one();
+        assert_eq!(events_rx.recv().await, Some("a-1"));
+        assert_eq!(events_rx.recv().await, Some("a-2"));
+        chat_a.await.unwrap();
+        chat_b.await.unwrap();
     }
 }

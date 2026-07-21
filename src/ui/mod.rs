@@ -983,7 +983,8 @@ fn render_pairing(
     expires_at: Instant,
     theme: Theme,
 ) {
-    let modal_area = centered_rect(area, 90, area.height.saturating_sub(2).min(38));
+    let (code_width, code_height) = pairing_code_size(code);
+    let modal_area = pairing_modal_area(area, code_width, code_height);
     frame.render_widget(Clear, modal_area);
     let block = Block::new()
         .title(" Link WhatsCLI ")
@@ -993,13 +994,41 @@ fn render_pairing(
         .style(Style::new().bg(theme.surface));
     let inner = block.inner(modal_area);
     frame.render_widget(block, modal_area);
+    if inner.width < code_width
+        || inner.height < code_height.saturating_add(PAIRING_FIXED_CONTENT_HEIGHT)
+    {
+        let message_area = centered_rect(inner, 100, 4.min(inner.height));
+        frame.render_widget(
+            Paragraph::new(Text::from(vec![
+                Line::styled(
+                    "Terminal too small for this QR code",
+                    Style::new().fg(theme.warning).bold(),
+                ),
+                Line::styled(
+                    format!(
+                        "Resize to at least {} columns × {} rows",
+                        code_width.saturating_add(PAIRING_CHROME_WIDTH),
+                        code_height
+                            .saturating_add(PAIRING_FIXED_CONTENT_HEIGHT)
+                            .saturating_add(PAIRING_CHROME_HEIGHT)
+                    ),
+                    Style::new().fg(theme.muted),
+                ),
+                Line::from(""),
+                Line::styled("Esc hides this code", Style::new().fg(theme.error)),
+            ]))
+            .alignment(Alignment::Center),
+            message_area,
+        );
+        return;
+    }
     let remaining = expires_at
         .saturating_duration_since(Instant::now())
         .as_secs();
     let parts = Layout::vertical([
-        Constraint::Length(3),
+        Constraint::Length(PAIRING_HEADER_HEIGHT),
         Constraint::Min(3),
-        Constraint::Length(2),
+        Constraint::Length(PAIRING_FOOTER_HEIGHT),
     ])
     .split(inner);
     frame.render_widget(
@@ -1032,6 +1061,44 @@ fn render_pairing(
             .alignment(Alignment::Center),
         parts[2],
     );
+}
+
+const PAIRING_HEADER_HEIGHT: u16 = 3;
+const PAIRING_FOOTER_HEIGHT: u16 = 2;
+const PAIRING_FIXED_CONTENT_HEIGHT: u16 = PAIRING_HEADER_HEIGHT + PAIRING_FOOTER_HEIGHT;
+// One cell each for the border and padding on every side.
+const PAIRING_CHROME_WIDTH: u16 = 4;
+const PAIRING_CHROME_HEIGHT: u16 = 4;
+
+fn pairing_code_size(code: &str) -> (u16, u16) {
+    let width = code
+        .lines()
+        .map(UnicodeWidthStr::width)
+        .max()
+        .unwrap_or_default()
+        .min(u16::MAX as usize) as u16;
+    let height = code.lines().count().min(u16::MAX as usize) as u16;
+    (width, height)
+}
+
+fn pairing_modal_area(area: Rect, code_width: u16, code_height: u16) -> Rect {
+    let default_width = area.width.saturating_mul(90) / 100;
+    let width = default_width
+        .max(code_width.saturating_add(PAIRING_CHROME_WIDTH))
+        .clamp(1, area.width);
+    let desired_height = code_height
+        .saturating_add(PAIRING_FIXED_CONTENT_HEIGHT)
+        .saturating_add(PAIRING_CHROME_HEIGHT);
+    let height_with_margin = area.height.saturating_sub(2);
+    let height = if desired_height <= height_with_margin {
+        // Preserve the roomy layout for small placeholder/test QR codes.
+        desired_height.max(38).min(height_with_margin)
+    } else {
+        // A real WhatsApp QR often needs the last two rows that the old fixed
+        // 38-row modal clipped. Use the full terminal before giving up.
+        desired_height.min(area.height)
+    };
+    centered_size(area, width, height.max(1))
 }
 
 fn render_text_modal(frame: &mut Frame<'_>, area: Rect, title: &str, body: &str, theme: Theme) {
@@ -1139,6 +1206,10 @@ fn render_toast(frame: &mut Frame<'_>, area: Rect, toast: &Toast, theme: Theme) 
 fn centered_rect(area: Rect, width_percent: u16, height: u16) -> Rect {
     let width = (area.width.saturating_mul(width_percent) / 100).clamp(1, area.width);
     let height = height.clamp(1, area.height);
+    centered_size(area, width, height)
+}
+
+fn centered_size(area: Rect, width: u16, height: u16) -> Rect {
     Rect::new(
         area.x + area.width.saturating_sub(width) / 2,
         area.y + area.height.saturating_sub(height) / 2,
@@ -1177,5 +1248,30 @@ mod tests {
                 > fuzzy_score("send", "session ended").unwrap()
         );
         assert!(fuzzy_score("xyz", "send image").is_none());
+    }
+
+    #[test]
+    fn pairing_modal_expands_to_show_every_qr_row() {
+        let area = Rect::new(0, 0, 100, 46);
+        let modal = pairing_modal_area(area, 73, 37);
+
+        assert_eq!(modal.height, 46);
+        assert!(modal.width >= 73 + PAIRING_CHROME_WIDTH);
+
+        let inner_height = modal.height - PAIRING_CHROME_HEIGHT;
+        assert!(inner_height >= 37 + PAIRING_FIXED_CONTENT_HEIGHT);
+    }
+
+    #[test]
+    fn pairing_modal_reports_when_the_terminal_cannot_fit_the_qr() {
+        let area = Rect::new(0, 0, 70, 35);
+        let modal = pairing_modal_area(area, 73, 37);
+        let inner_width = modal.width.saturating_sub(PAIRING_CHROME_WIDTH);
+        let inner_height = modal.height.saturating_sub(PAIRING_CHROME_HEIGHT);
+
+        assert!(
+            inner_width < 73 || inner_height < 37 + PAIRING_FIXED_CONTENT_HEIGHT,
+            "the test terminal should be too small for the QR code"
+        );
     }
 }

@@ -25,31 +25,26 @@ cat > "$stable_dir/PKGBUILD" <<EOF
 pkgname=whatscli
 pkgver=${pkgver}
 pkgrel=1
-pkgdesc='A command line interface for WhatsApp, based on go-whatsmeow and tview'
+pkgdesc='A native terminal client for WhatsApp, written in Rust'
 arch=('i686' 'x86_64' 'armv7h' 'armv6h' 'aarch64')
 url='https://github.com/normen/whatscli'
-makedepends=('go' 'git')
+makedepends=('cargo' 'rust' 'git')
 source=("\${pkgname}-\${pkgver}.tar.gz::https://github.com/normen/whatscli/archive/v\${pkgver}.tar.gz")
 sha1sums=('${sha1}')
 
 build() {
     cd "\${pkgname}-\${pkgver}"
-    export CGO_CPPFLAGS="\${CPPFLAGS}"
-    export CGO_CFLAGS="\${CFLAGS}"
-    export CGO_CXXFLAGS="\${CXXFLAGS}"
-    export CGO_LDFLAGS="\${LDFLAGS}"
-    export GOFLAGS="-buildmode=pie -trimpath -mod=readonly -modcacherw"
-    go build -o "\${pkgname}" -ldflags "-s -w -X main.VERSION=v\${pkgver}" .
+    cargo build --release --locked
 }
 
 package() {
-    install -Dm755 "\${pkgname}-\${pkgver}/\${pkgname}" "\${pkgdir}/usr/bin/\${pkgname}"
+    install -Dm755 "\${pkgname}-\${pkgver}/target/release/\${pkgname}" "\${pkgdir}/usr/bin/\${pkgname}"
 }
 EOF
 
 cat > "$stable_dir/.SRCINFO" <<EOF
 pkgbase = whatscli
-	pkgdesc = A command line interface for WhatsApp, based on go-whatsmeow and tview
+	pkgdesc = A native terminal client for WhatsApp, written in Rust
 	pkgver = ${pkgver}
 	pkgrel = 1
 	url = https://github.com/normen/whatscli
@@ -58,7 +53,8 @@ pkgbase = whatscli
 	arch = armv7h
 	arch = armv6h
 	arch = aarch64
-	makedepends = go
+	makedepends = cargo
+	makedepends = rust
 	makedepends = git
 	source = whatscli-${pkgver}.tar.gz::https://github.com/normen/whatscli/archive/v${pkgver}.tar.gz
 	sha1sums = ${sha1}
@@ -72,10 +68,10 @@ pkgname=whatscli-git
 _pkgname=whatscli
 pkgver=0
 pkgrel=1
-pkgdesc='A command line interface for WhatsApp, based on go-whatsmeow and tview'
+pkgdesc='A native terminal client for WhatsApp, written in Rust'
 url='https://github.com/normen/whatscli'
 arch=('i686' 'x86_64' 'armv7h')
-makedepends=('git' 'go')
+makedepends=('git' 'cargo' 'rust')
 source=("git+${url}.git")
 sha256sums=('SKIP')
 
@@ -89,16 +85,11 @@ pkgver() {
 
 build() {
   cd "${srcdir}/${_pkgname}"
-  export CGO_CPPFLAGS="${CPPFLAGS}"
-  export CGO_CFLAGS="${CFLAGS}"
-  export CGO_CXXFLAGS="${CXXFLAGS}"
-  export CGO_LDFLAGS="${LDFLAGS}"
-  export GOFLAGS="-buildmode=pie -trimpath -mod=readonly -modcacherw"
-  go build -o "${_pkgname}" -ldflags "-s -w -X main.VERSION=${pkgver}" .
+  cargo build --release --locked
 }
 
 package() {
-  install -Dm755 "${srcdir}/${_pkgname}/${_pkgname}" "${pkgdir}/usr/bin/${_pkgname}"
+  install -Dm755 "${srcdir}/${_pkgname}/target/release/${_pkgname}" "${pkgdir}/usr/bin/${_pkgname}"
 }
 
 # vim: ft=sh ts=2 sw=2 et
@@ -106,7 +97,7 @@ EOF
 
 cat > "$git_dir/.SRCINFO" <<EOF
 pkgbase = whatscli-git
-	pkgdesc = A command line interface for WhatsApp, based on go-whatsmeow and tview
+	pkgdesc = A native terminal client for WhatsApp, written in Rust
 	pkgver = ${git_pkgver}
 	pkgrel = 1
 	url = https://github.com/normen/whatscli
@@ -114,7 +105,8 @@ pkgbase = whatscli-git
 	arch = x86_64
 	arch = armv7h
 	makedepends = git
-	makedepends = go
+	makedepends = cargo
+	makedepends = rust
 	provides = whatscli
 	conflicts = whatscli
 	source = git+https://github.com/normen/whatscli.git

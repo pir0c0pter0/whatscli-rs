@@ -1,121 +1,152 @@
-# whatscli
+# WhatsCLI RS
 
-A command line interface for WhatsApp, based on [go-whatsmeow](https://github.com/tulir/whatsmeow) and [tview](https://github.com/rivo/tview)
+WhatsCLI RS is a modern Rust port of
+[normen/whatscli](https://github.com/normen/whatscli), rebuilt around a responsive,
+keyboard-first terminal interface. It uses
+[`whatsapp-rust`](https://github.com/jlucaso1/whatsapp-rust) for the multi-device protocol and
+Ratatui/Crossterm for the interface.
 
-![whatscli-screenshot](/doc/screenshot.png?raw=true "WhatsCLI 0.6.5")
+![WhatsCLI modern terminal interface](doc/screenshot.svg)
+
+> WhatsCLI is an unofficial client. Using third-party WhatsApp clients may violate WhatsApp's
+> terms and can result in account suspension. Use it at your own risk.
 
 ## Features
 
-Things that work.
+- QR-code login with an encrypted, persistent multi-device session
+- Live messages and history synchronization for contacts and groups
+- Text, image, video, audio and document send/download support
+- Read receipts, unread counters, message info, URL opening and revocation
+- Group creation, leave, subject changes, member add/remove and admin changes
+- Configurable colors, key bindings, desktop notifications and terminal image previews
+- Safe filename handling and contact/push-name refreshes
+- Responsive keyboard-first interface with message bubbles, chat search and a command palette
+- WhatsApp Dark, high-contrast, custom and ANSI-16 themes
 
-- Sending and receiving WhatsApp messages in a command line app
-- Connects through the Web App API without a browser
-- Uses QR code for simple setup
-- Allows downloading and opening image/video/audio/document attachments
-- Allows sending images, video, audio and documents
-- Allows color customization
-- Allows basic group management
-- Supports desktop notifications
-- Binaries for Windows, Mac, Linux and RaspBerry Pi
+## Build and install
 
-### Caveats
+Rust 1.97.1 is pinned by `rust-toolchain.toml`.
 
-Heres some things you might expect to work that don't. Plus some other things I should mention.
+```bash
+cargo build --release --locked
+cargo install --path . --locked
+```
 
-- Message history depends on what WhatsApp syncs to companion devices and may require `/backlog`
-- No automation of messages, no sending of messages through shell commands
-- Meta obviously doesn't endorse or like these kinds of apps and they're likely to break when WhatsApp changes stuff in their web app
+Or use the Makefile:
 
-## Similar Apps
+```bash
+make test
+make build
+make install
+```
 
-Similar but more features:
-- [Nchat](https://github.com/d99kris/nchat)
+On first launch, scan the QR code with **WhatsApp → Linked devices → Link a device**.
 
-## Installation
+### Migrating from the Go release
 
-How to get it running and how to use it
-
-### Latest Release
-
-Always fresh, always up to date.
-
-- Download a release
-- Put the binary in your PATH (optional)
-- Run with `whatscli` (or double-click)
-- Scan the QR code with WhatsApp on your phone (resize shell or change font size to see whole code)
-
-### Package Managers
-
-Some ways to install via package managers are supported but the installed version might be out of date.
-
-#### MacOS (homebrew)
-
-- `brew install normen/tap/whatscli`
-
-#### Arch Linux (AUR)
-
-- `https://aur.archlinux.org/packages/whatscli/`
+The old Go session database cannot be reused because the native Rust protocol backend has a
+different encrypted storage schema. The first Rust launch asks for a one-time re-pair and stores
+the new session in `~/.config/whatscli/session-rust.db`. The existing `whatscli.config` remains
+compatible and is loaded without changes.
 
 ## Usage
 
-Most information, all commands and key bindings are availabe through the in-app help, simply type `/help` and/or `/commands`.
+The default global keys are:
 
-### Login
+| Key | Action |
+| --- | --- |
+| `Tab` | Switch between input and chats |
+| `Ctrl+w` | Focus the message panel |
+| `Ctrl+Space` | Focus input |
+| `Ctrl+e` | Focus chats |
+| `Ctrl+f` | Search conversations incrementally |
+| `Ctrl+p` | Open the searchable command palette |
+| `Ctrl+b` | Load older messages |
+| `Ctrl+n` | Mark the selected chat read |
+| `Ctrl+r` | Connect |
+| `Ctrl+q` | Quit |
+| `Ctrl+c` / `Ctrl+v` | Copy/paste a selected user ID |
 
-When starting up, whatscli will immediately try to connect to the WhatsApp server to log in. Keep your phone ready to scan the appearing QR code in WhatsApp on your Phone. If you don't manage to scan the code quick enough just restart the application. If you can not see the whole QR code, reduce the font size of your terminal or increase the window size.
+In the message panel, use arrows or `j`/`k` to select a message. The defaults are `d` download,
+`o` open, `s` show image, `u` open URL, `i` info and `r` revoke.
 
-After scanning the QR code the chats should be populated. After you have done this once, whatscli will be able to log into WhatsApp automatically on start. To log out of WhapsApp completely type `/logout`.
+Commands use `/` by default:
 
-### Messaging / Commands
+```text
+/connect                 connect to WhatsApp
+/disconnect              close the connection
+/logout                  unlink this device
+/reset                   unlink and remove the Rust session database
+/backlog                 request older messages
+/read                    mark the current chat read
+/upload /path/file       send a document
+/sendimage /path/file    send an image
+/sendvideo /path/file    send a video
+/sendaudio /path/file    send audio
+/leave                   leave the current group
+/create [jid ...] name   create a group
+/subject new name        change the group subject
+/add jid ...             add members
+/remove jid ...          remove members
+/admin jid ...           promote members
+/removeadmin jid ...     demote members
+/colorlist               show supported terminal colors
+```
 
-Select a chat on the left and start typing in the input field at the bottom to send messages. Switch between the chat list and the input fiel with `<Tab>`.
+Use `/help` in the app for keys and `/commands` for the command list.
 
-For issuing commands the same input field is used. By default commands are prefixed with `/`. You can for example use the `/sendimage /path/to/file.jpg` command to send images, see `/help` for more commands.
+The composer supports cursor movement with `Left`/`Right`, `Home`/`End`, and safe
+`Backspace`/`Delete` editing for emoji and accented text. `Esc` closes the active overlay first,
+then returns focus to the composer.
 
-When paths are given for commands you don't need to surround the path in quotes, even if it contains spaces. Also don't prefix spaces with backslashes (as the copy-paste function of MacOS does for example).
+## Configuration
 
-### Messages
+Configuration is stored at `~/.config/whatscli/whatscli.config`. Missing files are created with
+defaults. The legacy INI sections and keys (`general`, `keymap`, `ui`, `colors`) are preserved.
 
-When pressing `Ctrl-w` (default mapping) you enter "message selection mode" which allows selecting a single message and performing operations on them. For example pressing `o` while a message is selected allows opening any attachments through an external application.
+Images can be rendered through an external command such as `jp2a`; configure `show_command`.
+Downloads and previews use `download_path` and `preview_path`. Desktop notifications are enabled
+with `enable_notifications = true`, or use `use_terminal_bell = true`.
 
-#### Image display
+The optional UI settings are:
 
-You can display images in whatscli using external programs that convert the image to UTF characters. I found that `jp2a` works well for jpeg images, it is available through package managers on most systems. However the "image quality" leaves a lot to be desired. The [PIXterm](https://github.com/eliukblau/pixterm) app allows displaying true-color versions of the images which are quite recognizable already.
+```ini
+[ui]
+theme = whatsapp-dark       ; whatsapp-dark, high-contrast, or custom
+color_mode = auto           ; auto, truecolor, or ansi16
+wide_breakpoint = 100
+compact_breakpoint = 72
+short_height = 18
 
-To configure the used command and its parameters edit the `show_command` parameter in `whatscli.config`, see `/help` for the config file location.
+[keymap]
+open_palette = Ctrl+p
+search_chats = Ctrl+f
+```
 
-#### Copy-Pasting User IDs
+At 100 columns and above, conversations include a preview, time and unread badge. Between 72 and
+99 columns the sidebar is condensed; below 72 columns, `Tab` switches the single visible panel.
+Legacy configuration files still load unchanged. If their old color values are untouched, the new
+`whatsapp-dark` theme is applied in memory. Existing color customizations select `custom` in memory;
+WhatsCLI never rewrites an existing configuration file silently.
 
-Some commands such as the `/add` and `/remove` require a "user id" as their input. You can copy the user ID of a selected chat or a selected message to the clipboard with `Ctrl-c` (default mapping) and easily append them to the current input using `Ctrl-v`.
+## Architecture
 
-### Notifications
+- `src/app.rs`: event routing, commands, selection and configurable key bindings
+- `src/ui/`: responsive Ratatui components, semantic themes and grapheme-safe editor
+- `src/session.rs`: async WhatsApp session, commands, events, groups and media
+- `src/storage.rs`: in-memory chat/contact/message model and ordering
+- `src/config.rs`: XDG paths and backwards-compatible INI configuration
+- `src/qr.rs`: terminal QR rendering
 
-The app supports basic desktop notifications through the `gen2brain/beeep` library, to enable it set `enable_notifications = true` in `whatscli.config`. Set `use_terminal_bell = true` to ring your terminal's bell instead of sending a desktop notification.
-
-### Configuration
-
-Most key bindings, colors and other options can be configured in the `whatscli.config` file, the `/help` command shows its location.
-
-## Development
-
-This app started as my first attempt at writing something in go. Some areas that are marked with `TODO` can still be improved but work mostly. If you want to contribute features or improve the code thats great, send a PR and we can discuss.
-
-### Building
-
-Using a recent version of go, building should be straightforward. Either use `go build`, `go run` etc. or use the included Makefile.
-
-### Structure Overview
-
-The `main.go` contains most UI elements which are based around a tview app running on the main routine. It uses a keymap configuration based on the tslocum/cbind library. Apart from that it mostly manages the selection of messages in the current chat as well as displaying the messages and chat list that the session manager sends.
-
-The `messages/session_manager.go` runs a separate go routine to receive messages from the `go-whatsmeow` library which in turn runs the websocket connection to the WhatsApp server. The session manager receives the messages from `go-whatsmeow` and the commands from the UI via channels that it drains on its main routine. It then updates the UI accordingly using the `UiMessageHandler` interface. This ensures "thread safe" management of the connection and data while both UI and network connection run separately.
-
-Session manager is designed "object like", the MessageDatabase in `messages/storage.go` is similar and somewhat linked to the session manager. In theory the session manager could be run multiple times (multiple accounts) or a different implementation of a session manager could connect to a different service like e.g. Telegram.
-
-In `messages/messages.go` most interfaces and data structures for communication are kept.
-
-The `config/settings.go` keeps a singleton `Config` struct with the config that is loaded via the gopkg.in/ini.v1 library when the app starts. This makes it easy to quickly add new configuration items with default values that can be used across the app.
+The Tokio runtime owns the protocol tasks. WhatsApp events and UI commands cross unbounded async
+channels, while the in-memory database is protected by a single async mutex so updates remain
+ordered and snapshots are consistent.
 
 ## License
 
-This software is released under MIT license. Remember that this gives you all freedom except for slapping your name on it.
+MIT. See [LICENSE](LICENSE).
+
+## Credits
+
+- Original WhatsCLI project by [normen](https://github.com/normen)
+- Rust port and modern interface by [Pir0c0pter0](https://github.com/Pir0c0pter0)

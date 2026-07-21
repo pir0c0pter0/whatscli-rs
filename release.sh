@@ -7,7 +7,7 @@ usage() {
   cat <<'EOF'
 Usage: ./release.sh [version] [--no-watch]
 
-If version is omitted, the script reads VERSION from main.go.
+If version is omitted, the script reads the package version from Cargo.toml.
 It then creates the git tag, pushes it, and waits for the GitHub Actions
 "Release" workflow that publishes assets, updates the Homebrew tap, and
 publishes the AUR packages.
@@ -22,7 +22,11 @@ require_cmd() {
 }
 
 extract_version() {
-  sed -n 's/^var VERSION string = "\(v[^"]*\)"$/\1/p' main.go | head -n1
+  local package_version
+  package_version="$(sed -n '/^\[package\]$/,/^\[/s/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n1)"
+  if [ -n "$package_version" ]; then
+    printf 'v%s\n' "$package_version"
+  fi
 }
 
 wait_for_run() {
@@ -65,9 +69,6 @@ trigger_workflow_dispatch() {
 }
 
 main() {
-  require_cmd git
-  require_cmd gh
-
   local version=""
   local watch_release=1
 
@@ -92,12 +93,15 @@ main() {
     shift
   done
 
+  require_cmd git
+  require_cmd gh
+
   if [ -z "$version" ]; then
     version="$(extract_version)"
   fi
 
   if [ -z "$version" ]; then
-    echo "Could not determine release version from main.go" >&2
+    echo "Could not determine release version from Cargo.toml" >&2
     exit 1
   fi
 

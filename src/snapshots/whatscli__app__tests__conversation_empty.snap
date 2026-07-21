@@ -1,0 +1,28 @@
+---
+source: src/app.rs
+expression: "render(&app, 100, 24)"
+---
+ WhatsCLI v1.1.5  Choose a conversation ● online
+  conversations / thread / composer
+ Conversations               │
+ › • Maria Oliveira [2]      │
+     Você viu as fotos da vi │
+     ◇ message  12:06        │
+   # Equipe Produto          │
+     Ravi: revisão amanhã às │
+     ◇ message  09:20        │                                   ◉
+                             │           Your conversations, without leaving the terminal
+                             │         Select a chat on the left or press Ctrl+f to search.
+                             │                      Ctrl+p opens every action.
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+┌ Message ─────────────────────────────────────────────────────────────────────────────────────────┐
+│ Select a conversation to start                                                                   │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+ Enter send  ·  Ctrl+p commands  ·  Ctrl+f search  ·  Tab chats

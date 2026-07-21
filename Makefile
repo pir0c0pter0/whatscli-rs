@@ -1,22 +1,25 @@
-# Simple Makefile for go
-
 build:
-	go build
+	cargo build --release --locked
 
 clean:
-	go clean
+	cargo clean
 
 run:
-	go run .
+	cargo run
 
 install:
-	go install .
-
-get:
-	go get
+	cargo install --path . --locked
 
 update:
-	go get -u
+	cargo update
+
+test:
+	cargo test --locked
+
+check:
+	cargo fmt --check
+	cargo clippy --all-targets -- -D warnings
+	cargo test --locked
 
 release:
 	./release.sh

@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="900" viewBox="0 0 1440 900" role="img" aria-labelledby="title desc">
+  <title id="title">WhatsCLI modern terminal interface</title>
+  <desc id="desc">Dark WhatsApp-inspired terminal interface with conversations, directional message bubbles, composer and command hints.</desc>
+  <rect width="1440" height="900" rx="18" fill="#071016"/>
+  <rect x="18" y="18" width="1404" height="864" rx="12" fill="#0B141A" stroke="#202C33" stroke-width="2"/>
+  <rect x="18" y="18" width="1404" height="66" rx="12" fill="#111B21"/>
+  <rect x="18" y="66" width="1404" height="18" fill="#111B21"/>
+  <rect x="40" y="34" width="208" height="34" rx="4" fill="#00A884"/>
+  <text x="58" y="58" fill="#0B141A" font-family="Noto Sans Mono, monospace" font-size="20" font-weight="700">WhatsCLI v1.1.5</text>
+  <text x="278" y="58" fill="#E9EDEF" font-family="Noto Sans Mono, monospace" font-size="19" font-weight="700">Maria Oliveira</text>
+  <circle cx="1282" cy="51" r="6" fill="#00A884"/>
+  <text x="1298" y="58" fill="#00A884" font-family="Noto Sans Mono, monospace" font-size="17" font-weight="700">online</text>
+
+  <rect x="18" y="84" width="378" height="704" fill="#111B21"/>
+  <line x1="396" y1="84" x2="396" y2="788" stroke="#202C33" stroke-width="2"/>
+  <text x="42" y="122" fill="#8696A0" font-family="Noto Sans Mono, monospace" font-size="16">CONVERSATIONS</text>
+  <rect x="32" y="144" width="350" height="116" rx="4" fill="#202C33"/>
+  <text x="48" y="180" fill="#00A884" font-family="Noto Sans Mono, monospace" font-size="22">› •</text>
+  <text x="94" y="180" fill="#E9EDEF" font-family="Noto Sans Mono, monospace" font-size="19" font-weight="700">Maria Oliveira</text>
+  <rect x="326" y="159" width="38" height="25" rx="4" fill="#00A884"/>
+  <text x="337" y="178" fill="#0B141A" font-family="Noto Sans Mono, monospace" font-size="15" font-weight="700">2</text>
+  <text x="50" y="215" fill="#8696A0" font-family="Noto Sans Mono, monospace" font-size="15">Você viu as fotos da viagem?</text>
+  <text x="50" y="242" fill="#53BDEB" font-family="Noto Sans Mono, monospace" font-size="14">◇ text</text>
+  <text x="312" y="242" fill="#8696A0" font-family="Noto Sans Mono, monospace" font-size="14">12:06</text>
+  <text x="48" y="302" fill="#00A884" font-family="Noto Sans Mono, monospace" font-size="22">#</text>
+  <text x="82" y="302" fill="#E9EDEF" font-family="Noto Sans Mono, monospace" font-size="19" font-weight="700">Equipe Produto</text>
+  <text x="50" y="336" fill="#8696A0" font-family="Noto Sans Mono, monospace" font-size="15">Ravi: revisão amanhã às 9h</text>
+  <text x="50" y="366" fill="#53BDEB" font-family="Noto Sans Mono, monospace" font-size="14">◇ text</text>
+  <text x="312" y="366" fill="#8696A0" font-family="Noto Sans Mono, monospace" font-size="14">09:20</text>
+
+  <text x="478" y="128" fill="#00A884" font-family="Noto Sans Mono, monospace" font-size="14">──────── UNREAD MESSAGES ────────</text>
+  <rect x="438" y="158" width="486" height="126" rx="5" fill="#202C33"/>
+  <text x="456" y="190" fill="#00A884" font-family="Noto Sans Mono, monospace" font-size="16" font-weight="700">‹ Maria</text>
+  <text x="456" y="226" fill="#E9EDEF" font-family="Noto Sans Mono, monospace" font-size="18">Oi! Você viu as fotos da viagem? 📷</text>
+  <text x="456" y="262" fill="#8696A0" font-family="Noto Sans Mono, monospace" font-size="14">12:06  ◀</text>
+  <rect x="804" y="328" width="568" height="154" rx="5" fill="#005C4B"/>
+  <text x="824" y="362" fill="#00D7A7" font-family="Noto Sans Mono, monospace" font-size="16" font-weight="700">You</text>
+  <text x="824" y="400" fill="#E9EDEF" font-family="Noto Sans Mono, monospace" font-size="18">Vi sim — ficaram lindas. Depois te mando</text>
+  <text x="824" y="432" fill="#E9EDEF" font-family="Noto Sans Mono, monospace" font-size="18">as minhas também 😊</text>
+  <text x="824" y="464" fill="#9BCFC5" font-family="Noto Sans Mono, monospace" font-size="14">12:07  ▶</text>
+
+  <rect x="38" y="804" width="1364" height="54" rx="5" fill="#111B21" stroke="#00A884" stroke-width="2"/>
+  <text x="58" y="837" fill="#8696A0" font-family="Noto Sans Mono, monospace" font-size="17">Type a message or /command</text>
+  <text x="40" y="878" fill="#8696A0" font-family="Noto Sans Mono, monospace" font-size="14">Enter send  ·  Ctrl+p commands  ·  Ctrl+f search  ·  Tab chats</text>
+</svg>

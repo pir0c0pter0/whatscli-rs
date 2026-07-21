@@ -1,0 +1,36 @@
+---
+source: src/app.rs
+expression: "render(&app, 120, 32)"
+---
+ WhatsCLI v1.1.5  Maria Oliveira ● online
+  conversations / thread / composer
+ Conversations               │ ──────── unread messages ────────
+ › • Maria Oliveira [2]      │  Maria
+     Você viu as fotos da vi │  Oi! Você viu as fotos da viagem? 📷
+     ◇ message  12:06        │  12:06 ◀
+   # Equipe Produto          │
+     Ravi: revisão amanhã às │                            You
+     ◇ message  09:20        │                            Vi sim — ficaram lindas. Depois te mando as minhas também 😊
+                             │                            12:07 ▶
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │
+┌ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ Type a message or /command                                                                                           │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ Enter send  ·  Ctrl+p commands  ·  Ctrl+f search  ·  Tab chats

@@ -114,6 +114,7 @@ jobs:
           mkdir -p release-assets
           cp dist/linux-asset/whatscli release-assets/
           chmod +x release-assets/whatscli
+          cp release-assets/whatscli "release-assets/whatscli-${RELEASE_VERSION}-linux-x64"
           (
             cd release-assets
             zip "whatscli-${RELEASE_VERSION}-linux.zip" whatscli
@@ -121,6 +122,7 @@ jobs:
           )
 
           cp dist/windows-asset/whatscli.exe release-assets/
+          cp release-assets/whatscli.exe "release-assets/whatscli-${RELEASE_VERSION}-windows-x64.exe"
           (
             cd release-assets
             zip "whatscli-${RELEASE_VERSION}-windows.zip" whatscli.exe
@@ -129,6 +131,7 @@ jobs:
 
           cp dist/raspberrypi-asset/whatscli release-assets/whatscli
           chmod +x release-assets/whatscli
+          cp release-assets/whatscli "release-assets/whatscli-${RELEASE_VERSION}-linux-armv7"
           (
             cd release-assets
             zip "whatscli-${RELEASE_VERSION}-raspberrypi.zip" whatscli
@@ -159,7 +162,7 @@ jobs:
           tag_name: ${{ steps.meta.outputs.version }}
           name: ${{ steps.meta.outputs.version }}
           body_path: changes.txt
-          files: release-assets/*.zip
+          files: release-assets/*
           draft: false
           prerelease: false
 

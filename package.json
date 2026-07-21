@@ -1,0 +1,24 @@
+{
+  "name": "whatscli",
+  "version": "1.1.5",
+  "description": "Terminal WhatsApp client written in Rust",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Pir0c0pter0/whatscli-rs.git"
+  },
+  "bin": {
+    "whatscli": "npm/cli.js"
+  },
+  "files": [
+    "npm/cli.js",
+    "npm/install.js"
+  ],
+  "scripts": {
+    "postinstall": "node npm/install.js",
+    "test:npm": "node --test npm/install.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

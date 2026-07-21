@@ -28,16 +28,24 @@ Ratatui/Crossterm for the interface.
 
 ## Build and install
 
-Rust 1.97.1 is pinned by `rust-toolchain.toml`.
+Install the prebuilt binary with npm (Node.js 18 or newer):
+
+```bash
+npm install --global whatscli
+```
+
+Prebuilt npm binaries are available for Linux x64, Raspberry Pi ARM and Windows x64. Audio and
+video playback also requires `ffmpeg` and `ffprobe` in `PATH`; photos, stickers, documents and
+normal chat operation work without FFmpeg.
+
+To build from source, Rust 1.97.1 is pinned by `rust-toolchain.toml`:
 
 ```bash
 cargo build --release --locked
 cargo install --path . --locked
 ```
 
-Audio and video playback requires `ffmpeg` and `ffprobe` in `PATH`. Photos, static/animated WebP
-stickers, documents and normal chat operation continue to work when FFmpeg is unavailable. Audio
-output uses the platform's default device (ALSA on Linux).
+Audio output uses the platform's default device (ALSA on Linux).
 
 Or use the Makefile:
 

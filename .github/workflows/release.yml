@@ -73,6 +73,9 @@ jobs:
         run: cargo install cross --locked
 
       - name: Build binary
+        env:
+          PKG_CONFIG_ALLOW_CROSS: "1"
+          PKG_CONFIG_PATH: /usr/lib/arm-linux-gnueabihf/pkgconfig
         run: |
           mkdir -p dist
           cross build --release --locked --target arm-unknown-linux-gnueabihf

@@ -3,7 +3,7 @@ source: src/app.rs
 expression: "format!(\"{:?}\\n{}\", Theme::from_config(&app.config),\nrender(&mut app, 100, 24))"
 ---
 Theme { background: Rgb(11, 20, 26), surface: Rgb(17, 27, 33), elevated: Rgb(32, 44, 51), foreground: Rgb(233, 237, 239), muted: Rgb(134, 150, 160), primary: Rgb(0, 168, 132), info: Rgb(83, 189, 235), warning: Rgb(255, 210, 121), error: Rgb(241, 92, 109), incoming: Rgb(32, 44, 51), outgoing: Rgb(0, 92, 75), mode: TrueColor }
- WhatsCLI v1.1.6  Choose a conversation ● online
+ WhatsCLI v1.1.7  Choose a conversation ● online
   conversations / thread / composer         ┌────────────────────────────────────────────────────┐
  Conversations               │              │ Connection failed. Try again.                      │
  › • Maria Oliveira [2]      │              └────────────────────────────────────────────────────┘

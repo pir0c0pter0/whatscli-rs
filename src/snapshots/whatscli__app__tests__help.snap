@@ -2,7 +2,7 @@
 source: src/app.rs
 expression: "render(&mut app, 100, 28)"
 ---
- WhatsCLI v1.1.5  Maria Oliveira ● online
+ WhatsCLI v1.1.6  Maria Oliveira ● online
   conversations / thread / composer
  Conversations┌ Keyboard & mouse help ───────────────────────────────────────────────┐
  › • Maria Oli│                                                                      │

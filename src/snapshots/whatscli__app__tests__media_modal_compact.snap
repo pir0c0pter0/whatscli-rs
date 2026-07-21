@@ -2,7 +2,7 @@
 source: src/app.rs
 expression: "render(&mut app, 86, 26)"
 ---
- WhatsCLI v1.1.5  Maria Oliveira ● online
+ WhatsCLI v1.1.6  Maria Oliveira ● online
   con┌ photo.webp · image · Halfblocks ────────────────────────────────────────┐
  Conv│                                                                         │
  › • │                                                                         │

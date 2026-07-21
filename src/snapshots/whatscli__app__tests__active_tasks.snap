@@ -1,8 +1,8 @@
 ---
 source: src/app.rs
-expression: "render(&app, 100, 24)"
+expression: "render(&mut app, 100, 24)"
 ---
- WhatsCLI v1.1.5  Maria Oliveira ● online
+ WhatsCLI v1.1.6  Maria Oliveira ● online
   conversations / thread / composer
  Conversations               │ ░░░ loading older messages
  › • Maria Oliveira [2]      │   ░░░░░░░░░░░░░░░░░

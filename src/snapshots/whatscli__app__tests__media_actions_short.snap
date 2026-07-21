@@ -2,7 +2,7 @@
 source: src/app.rs
 expression: "render(&mut app, 100, 12)"
 ---
- WhatsCLI v1.1.5  Maria Oliveira ● online
+ WhatsCLI v1.1.6  Maria Oliveira ● online
  Conversations               │                        ›You
  › • Maria Oliveira [2]      │                         Vi sim — ficaram lindas. Depois te mando as
      Você viu as fotos da vi │                         minhas também 😊

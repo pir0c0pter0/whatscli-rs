@@ -1,8 +1,8 @@
 ---
 source: src/app.rs
-expression: "render(&app, 100, 28)"
+expression: "render(&mut app, 100, 28)"
 ---
- WhatsCLI v1.1.5  Maria Oliveira ● online
+ WhatsCLI v1.1.6  Maria Oliveira ● online
   con┌ Link WhatsCLI ─────────────────────────────────────────────────────────────────────────┐
  Conv│                                                                                        │
  › • │                            Scan with WhatsApp on your phone                            │

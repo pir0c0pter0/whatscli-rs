@@ -1,4 +1,5 @@
 pub mod app;
+pub mod cache;
 pub mod config;
 pub mod logging;
 pub mod model;

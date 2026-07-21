@@ -206,6 +206,7 @@ impl SessionManager {
             "disconnect" => self.client.disconnect().await,
             "logout" => {
                 self.client.logout().await?;
+                self.storage.clear_cache().await?;
                 self.text("Successfully logged out").await;
             }
             "reset" => self.reset_session().await?,
@@ -271,6 +272,7 @@ impl SessionManager {
 
     async fn reset_session(&self) -> Result<()> {
         self.client.logout().await?;
+        self.storage.clear_cache().await?;
         let marker = reset_marker(&self.config.session_file);
         tokio::fs::write(&marker, b"pending")
             .await
@@ -747,7 +749,6 @@ async fn supervise(
             last_seen: String::new(),
         }))
         .await;
-    let (storage, storage_task) = start_storage_actor(ui_tx.clone());
     let (protocol_tx, protocol_rx) = async_channel::unbounded();
     let initialize_task = TaskInfo {
         id: Command::new("initialize", Vec::new()).id,
@@ -760,7 +761,6 @@ async fn supervise(
     let initialization = SessionManager::initialize(Arc::clone(&config), protocol_tx);
     let (client, connection_task) = tokio::select! {
         _ = shutdown_rx.changed() => {
-            storage_task.abort();
             return;
         }
         result = initialization => match result {
@@ -779,11 +779,19 @@ async fn supervise(
                     })
                     .await;
                 let _ = ui_tx.send(UiEvent::Status(SessionStatus::default())).await;
-                storage_task.abort();
                 return;
             }
         }
     };
+    let account = client.get_pn().await.map(|jid| jid.to_string());
+    let (storage, storage_task) = start_storage_actor(
+        ui_tx.clone(),
+        config.cache_file.clone(),
+        account,
+        config.general.history_sync_limit,
+    )
+    .await;
+    let storage_shutdown = storage.clone();
     let context = SessionManager {
         storage,
         current_receiver: Arc::new(RwLock::new(String::new())),
@@ -799,7 +807,9 @@ async fn supervise(
         shutdown_rx,
     )
     .await;
-    storage_task.abort();
+    if let Err(error) = storage_shutdown.close().await {
+        log::error!("failed to close conversation cache cleanly: {error}");
+    }
     let _ = storage_task.await;
 }
 
@@ -1242,6 +1252,9 @@ async fn handle_event(
                     last_seen: String::new(),
                 }))
                 .await;
+            if let Some(account) = context.client.get_pn().await {
+                context.storage.set_account(account.to_string()).await?;
+            }
             load_groups(&context.client, &context.storage).await?;
         }
         Event::Disconnected(_) => {
@@ -1265,6 +1278,13 @@ async fn handle_event(
                     update.old_push_name.clone(),
                     update.new_push_name.clone(),
                 )
+                .await?;
+        }
+        Event::MarkChatAsReadUpdate(update) => {
+            let unread = usize::from(!update.action.read.unwrap_or(true));
+            context
+                .storage
+                .update_chat_unread(update.jid.to_string(), unread)
                 .await?;
         }
         Event::Message(raw, info) => {
@@ -1355,6 +1375,14 @@ async fn handle_history(
             .await?;
     }
     storage.refresh_contact_names().await?;
+    let candidate_ids = history
+        .conversations
+        .iter()
+        .flat_map(|conversation| history_messages(conversation, message_limit))
+        .filter_map(|historical| historical.message.as_ref())
+        .filter_map(|web| web.key.id.clone())
+        .collect::<Vec<_>>();
+    let messages_needing_hydration = storage.messages_needing_hydration(candidate_ids).await?;
     for conversation in &history.conversations {
         let chat_id = if conversation.id.is_empty() {
             conversation.new_jid.clone().unwrap_or_default()
@@ -1392,6 +1420,12 @@ async fn handle_history(
             let Some(web) = &historical.message else {
                 continue;
             };
+            let Some(message_id) = web.key.id.as_ref() else {
+                continue;
+            };
+            if !messages_needing_hydration.contains(message_id) {
+                continue;
+            }
             let Some(raw) = &web.message else { continue };
             let Some(info) = history_message_info(web, &chat_jid, client).await else {
                 continue;
@@ -2093,7 +2127,7 @@ mod tests {
     #[tokio::test]
     async fn text_drops_raw_proto_while_media_retains_it() {
         let (ui_tx, _ui_rx) = mpsc::channel(QUEUE_CAPACITY);
-        let (storage, storage_task) = start_storage_actor(ui_tx);
+        let (storage, storage_task) = start_storage_actor(ui_tx, PathBuf::new(), None, 200).await;
         let chat: Jid = "123@s.whatsapp.net".parse().unwrap();
         let info = MessageInfo {
             source: MessageSource {
@@ -2130,7 +2164,8 @@ mod tests {
         .await
         .unwrap();
         assert!(image.raw_message.is_some());
-        storage_task.abort();
+        storage.close().await.unwrap();
+        storage_task.await.unwrap();
     }
 
     #[tokio::test]

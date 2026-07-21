@@ -14,6 +14,7 @@ Ratatui/Crossterm for the interface.
 ## Features
 
 - QR-code login with an encrypted, persistent multi-device session
+- Instant conversation-list restoration from a separate local SQLite cache
 - Live messages and history synchronization for contacts and groups
 - Text, image, video, audio and document send/download support
 - Read receipts, unread counters, message info, URL opening and revocation
@@ -76,8 +77,8 @@ Commands use `/` by default:
 ```text
 /connect                 connect to WhatsApp
 /disconnect              close the connection
-/logout                  unlink this device
-/reset                   unlink and remove the Rust session database
+/logout                  unlink this device and remove its conversation cache
+/reset                   unlink and remove the session database and conversation cache
 /backlog                 request older messages
 /read                    mark the current chat read
 /upload /path/file       send a document
@@ -118,11 +119,22 @@ log_level = info          ; error, warn, info, debug, or trace
 log_retention_days = 7    ; daily files retained; minimum 1
 ```
 
-Automatic history synchronization keeps only the most recent `history_sync_limit` messages in
-each conversation to bound permanent memory use. `/backlog` requests produce `ON_DEMAND` batches,
-which are never truncated by this automatic limit and can extend the selected conversation
-explicitly. The unread count remains the server-provided value even when older unread messages are
-outside the local window.
+Conversation metadata, contacts, ordering, unread counters and recent messages are cached in
+`~/.config/whatscli/cache.db`, separately from the encrypted protocol session. The cache is loaded
+before connection events are processed, so the conversation list appears without waiting for a
+network history sync. Normal upgrades preserve the file and apply versioned schema migrations.
+
+The cache retains the most recent `history_sync_limit` messages per conversation; `0` keeps all
+cached messages. `/backlog` `ON_DEMAND` batches can extend the selected conversation for the current
+run, but only the configured recent window survives a restart. The unread count remains the
+server-provided value even when older unread messages are outside that window. Background history
+sync still runs to fill gaps and refresh metadata, while complete cached message IDs are skipped.
+
+Cached data is bound to the paired account and is never reused for a different account. `/logout`
+and `/reset` remove `cache.db` and its WAL/SHM sidecars after WhatsApp confirms the unlink. If the
+cache is corrupt, WhatsCLI preserves it with a `.corrupt-<timestamp>` suffix, warns at startup and
+rebuilds from sync. A binary that encounters a newer unsupported cache schema leaves it untouched,
+warns and runs with in-memory storage for that execution.
 
 Logs are written to `~/.config/whatscli/logs/whatscli.YYYY-MM-DD.log`, rotate daily and retain the
 configured number of files. Logs contain event types, states, queue measurements, history counts,
@@ -155,21 +167,24 @@ WhatsCLI never rewrites an existing configuration file silently.
 - `src/app.rs`: event routing, commands, selection and configurable key bindings
 - `src/ui/`: responsive Ratatui components, semantic themes and grapheme-safe editor
 - `src/session.rs`: background supervisor, categorized workers, WhatsApp session and integrations
-- `src/storage.rs`: exclusive storage actor, in-memory model and coalesced UI snapshots
+- `src/storage.rs`: exclusive in-memory storage actor and coalesced UI/cache snapshots
+- `src/cache.rs`: versioned conversation-cache schema, hydration, pruning and SQLite writer
 - `src/config.rs`: XDG paths and backwards-compatible INI configuration
 - `src/qr.rs`: terminal QR rendering
 
 The Ratatui loop only handles input, visual state and drawing. A Tokio supervisor owns the protocol,
 session, per-conversation, history, transfer and system-integration workers. User-initiated work
 stays on bounded queues whose saturation is reported immediately, while the ordered protocol event
-queue does not discard connection, message or history events during bursts. The in-memory database is
-owned exclusively by a storage actor, which coalesces consistent conversation/message snapshots
-before sending them to the UI. Synchronous clipboard, opener, notification and preview APIs run in
-Tokio's blocking pool.
+queue does not discard connection, message or history events during bursts. The in-memory database
+is owned exclusively by a storage actor, which coalesces consistent conversation/message snapshots
+before sending them to the UI. Cache mutations are also coalesced and committed by a dedicated
+SQLite writer, keeping database I/O away from protocol and keyboard events. Synchronous clipboard,
+opener, notification and preview APIs run in Tokio's blocking pool.
 
 The footer shows the most recently active background task and `+N` when other tasks are running.
-On exit, WhatsCLI stops accepting new work, disconnects the client, drains workers for up to three
-seconds, cancels anything still pending and then restores the terminal.
+On exit, WhatsCLI stops accepting new work, disconnects the client, drains workers, flushes and
+confirms the last conversation-cache transaction, cancels anything still pending after three
+seconds and then restores the terminal.
 
 See [CHANGELOG.md](CHANGELOG.md) for user-visible and architectural changes.
 

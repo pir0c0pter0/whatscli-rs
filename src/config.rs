@@ -78,6 +78,7 @@ pub struct Config {
     pub colors: Colors,
     pub config_file: PathBuf,
     pub session_file: PathBuf,
+    pub cache_file: PathBuf,
     pub startup_warnings: Vec<String>,
 }
 
@@ -148,6 +149,7 @@ impl Default for Config {
             },
             config_file: config_dir.join("whatscli.config"),
             session_file: config_dir.join("session-rust.db"),
+            cache_file: config_dir.join("cache.db"),
             startup_warnings: Vec::new(),
         }
     }
@@ -468,6 +470,7 @@ mod tests {
         let defaults = Config {
             config_file: path,
             session_file: directory.join("session-rust.db"),
+            cache_file: directory.join("cache.db"),
             ..Default::default()
         };
         (Config::load_config(defaults).unwrap(), directory)
@@ -475,7 +478,12 @@ mod tests {
 
     #[test]
     fn defaults_preserve_legacy_command_prefix() {
-        assert_eq!(Config::default().general.cmd_prefix, "/");
+        let config = Config::default();
+        assert_eq!(config.general.cmd_prefix, "/");
+        assert_eq!(
+            config.cache_file.file_name().and_then(|name| name.to_str()),
+            Some("cache.db")
+        );
     }
 
     #[test]

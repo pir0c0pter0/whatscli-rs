@@ -6,6 +6,11 @@ All notable changes to WhatsCLI RS are documented in this file.
 
 ### Added
 
+- A versioned SQLite conversation cache at `~/.config/whatscli/cache.db` that restores contacts,
+  conversation ordering, previews, unread counters, recent messages and media payloads before the
+  network history sync completes.
+- Account isolation, corrupt-cache preservation/rebuild, future-schema protection and automatic
+  migration of supported older cache schemas.
 - Daily rotating logs under `~/.config/whatscli/logs`, with configurable level and retention and
   redaction tests that keep QR data, identifiers, message content, media URLs and payloads out.
 - `history_sync_limit`, `log_level` and `log_retention_days` settings under `[general]`, with
@@ -18,6 +23,12 @@ All notable changes to WhatsCLI RS are documented in this file.
 
 ### Changed
 
+- History sync now batch-checks hydrated message IDs and converts only missing or incomplete
+  records while still applying server conversation metadata and unread counts.
+- `/backlog` messages remain available for the current run, while the on-disk cache retains only
+  the configured `history_sync_limit` window per conversation (`0` remains unlimited).
+- Cache writes are coalesced onto a dedicated transactional writer and shutdown now flushes and
+  confirms its final transaction; `/logout` and `/reset` remove the cache plus WAL/SHM sidecars.
 - Registered a synchronous ordered WhatsApp event handler backed by a lossless internal queue;
   history batches now wait for sequential processing instead of being dropped under pressure.
 - Limited automatic history sync to the 200 most recent messages per conversation by default;

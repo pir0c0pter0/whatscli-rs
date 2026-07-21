@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -6,6 +7,7 @@ use chrono::{DateTime, Local};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+use crate::cache::{self, CachedState};
 use crate::model::{
     CONTACT_SUFFIX, Chat, Contact, DatabaseSnapshot, GROUP_SUFFIX, Message, MessageKind, UiEvent,
 };
@@ -41,12 +43,36 @@ enum StorageCommand {
     Message(String, oneshot::Sender<Option<Message>>),
     OldestMessage(String, oneshot::Sender<Option<Message>>),
     MessageInfo(String, oneshot::Sender<String>),
+    MessagesNeedingHydration(Vec<String>, oneshot::Sender<HashSet<String>>),
+    SetAccount(String, oneshot::Sender<()>),
+    ClearCache(oneshot::Sender<Result<()>>),
+    Close(oneshot::Sender<Result<()>>),
 }
 
-pub fn start_storage_actor(ui_tx: mpsc::Sender<UiEvent>) -> (StorageHandle, JoinHandle<()>) {
+pub async fn start_storage_actor(
+    ui_tx: mpsc::Sender<UiEvent>,
+    cache_file: PathBuf,
+    account: Option<String>,
+    history_limit: usize,
+) -> (StorageHandle, JoinHandle<()>) {
+    let bootstrap = match account.as_ref() {
+        Some(account) => cache::open(cache_file.clone(), account.clone()).await,
+        None => cache::CacheBootstrap {
+            state: CachedState::default(),
+            writer: None,
+            warnings: Vec::new(),
+        },
+    };
     let (tx, rx) = mpsc::channel(QUEUE_CAPACITY);
     let handle = StorageHandle { tx };
-    let task = tokio::spawn(storage_actor(rx, ui_tx));
+    let task = tokio::spawn(storage_actor(
+        rx,
+        ui_tx,
+        cache_file,
+        account,
+        history_limit,
+        bootstrap,
+    ));
     (handle, task)
 }
 
@@ -190,13 +216,69 @@ impl StorageHandle {
             .await
             .map_err(|_| anyhow!("storage worker stopped"))
     }
+
+    pub async fn messages_needing_hydration(&self, ids: Vec<String>) -> Result<HashSet<String>> {
+        let (reply, response) = oneshot::channel();
+        self.send(StorageCommand::MessagesNeedingHydration(ids, reply))
+            .await?;
+        response
+            .await
+            .map_err(|_| anyhow!("storage worker stopped"))
+    }
+
+    pub async fn set_account(&self, account: String) -> Result<()> {
+        let (reply, response) = oneshot::channel();
+        self.send(StorageCommand::SetAccount(account, reply))
+            .await?;
+        response
+            .await
+            .map_err(|_| anyhow!("storage worker stopped"))
+    }
+
+    pub async fn clear_cache(&self) -> Result<()> {
+        let (reply, response) = oneshot::channel();
+        self.send(StorageCommand::ClearCache(reply)).await?;
+        response
+            .await
+            .map_err(|_| anyhow!("storage worker stopped"))??;
+        Ok(())
+    }
+
+    pub async fn close(&self) -> Result<()> {
+        let (reply, response) = oneshot::channel();
+        self.send(StorageCommand::Close(reply)).await?;
+        response
+            .await
+            .map_err(|_| anyhow!("storage worker stopped"))?
+    }
 }
 
-async fn storage_actor(mut rx: mpsc::Receiver<StorageCommand>, ui_tx: mpsc::Sender<UiEvent>) {
-    let mut database = MessageDatabase::default();
+async fn storage_actor(
+    mut rx: mpsc::Receiver<StorageCommand>,
+    ui_tx: mpsc::Sender<UiEvent>,
+    cache_file: PathBuf,
+    mut account: Option<String>,
+    history_limit: usize,
+    bootstrap: cache::CacheBootstrap,
+) {
+    let mut database = MessageDatabase::from_cached(bootstrap.state);
+    let mut writer = bootstrap.writer;
     let mut selected_chat = String::new();
     let mut revision = 0_u64;
     let mut dirty = true;
+    let mut persist_dirty = false;
+    for warning in bootstrap.warnings {
+        log::warn!("{warning}");
+        let _ = ui_tx.send(UiEvent::Error(warning)).await;
+    }
+    let _ = ui_tx
+        .send(UiEvent::Snapshot(DatabaseSnapshot {
+            revision,
+            selected_chat: selected_chat.clone(),
+            chats: database.chats(),
+            messages: Vec::new(),
+        }))
+        .await;
     let start = tokio::time::Instant::now() + Duration::from_millis(16);
     let mut snapshots = tokio::time::interval_at(start, Duration::from_millis(16));
     snapshots.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -205,26 +287,119 @@ async fn storage_actor(mut rx: mpsc::Receiver<StorageCommand>, ui_tx: mpsc::Send
         tokio::select! {
             command = rx.recv() => {
                 let Some(command) = command else { break };
-                let changed = apply_storage_command(command, &mut database, &mut selected_chat);
-                if changed {
-                    revision = revision.wrapping_add(1);
-                    dirty = true;
+                match command {
+                    StorageCommand::SetAccount(new_account, reply) => {
+                        if account.as_deref() != Some(&new_account) {
+                            if let Some(active_writer) = writer.take()
+                                && let Err(error) = active_writer
+                                    .shutdown(database.cached_state(history_limit))
+                                    .await
+                            {
+                                log::error!("cache flush failed while switching accounts: {error}");
+                            }
+                            let opened = cache::open(cache_file.clone(), new_account.clone()).await;
+                            database = MessageDatabase::from_cached(opened.state);
+                            writer = opened.writer;
+                            account = Some(new_account);
+                            for warning in opened.warnings {
+                                log::warn!("{warning}");
+                                let _ = ui_tx.send(UiEvent::Error(warning)).await;
+                            }
+                            revision = revision.wrapping_add(1);
+                            dirty = true;
+                            persist_dirty = false;
+                        }
+                        let _ = reply.send(());
+                        continue;
+                    }
+                    StorageCommand::ClearCache(reply) => {
+                        if let Some(active_writer) = writer.take()
+                            && let Err(error) = active_writer
+                                .shutdown(database.cached_state(history_limit))
+                                .await
+                        {
+                            log::error!("cache flush failed before cleanup: {error}");
+                        }
+                        let result = cache::remove_files(&cache_file).await;
+                        if result.is_ok() {
+                            database = MessageDatabase::default();
+                            account = None;
+                            revision = revision.wrapping_add(1);
+                            dirty = true;
+                            persist_dirty = false;
+                        }
+                        let _ = reply.send(result);
+                        continue;
+                    }
+                    StorageCommand::Close(reply) => {
+                        let result = if let Some(active_writer) = writer.take() {
+                            active_writer.shutdown(database.cached_state(history_limit)).await
+                        } else {
+                            Ok(())
+                        };
+                        let _ = reply.send(result);
+                        break;
+                    }
+                    command => {
+                        let persistent = command.persists();
+                        let changed = apply_storage_command(command, &mut database, &mut selected_chat);
+                        if changed {
+                            revision = revision.wrapping_add(1);
+                            dirty = true;
+                            persist_dirty |= persistent;
+                        }
+                    }
                 }
             }
-            _ = snapshots.tick(), if dirty => {
-                let snapshot = DatabaseSnapshot {
-                    revision,
-                    selected_chat: selected_chat.clone(),
-                    chats: database.chats(),
-                    messages: database.messages(&selected_chat),
-                };
-                match ui_tx.try_send(UiEvent::Snapshot(snapshot)) {
-                    Ok(()) => dirty = false,
-                    Err(mpsc::error::TrySendError::Full(_)) => {}
-                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+            _ = snapshots.tick(), if dirty || persist_dirty => {
+                if dirty {
+                    let snapshot = DatabaseSnapshot {
+                        revision,
+                        selected_chat: selected_chat.clone(),
+                        chats: database.chats(),
+                        messages: database.messages(&selected_chat),
+                    };
+                    match ui_tx.try_send(UiEvent::Snapshot(snapshot)) {
+                        Ok(()) => dirty = false,
+                        Err(mpsc::error::TrySendError::Full(_)) => {}
+                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                    }
+                }
+                if persist_dirty {
+                    if let Some(active_writer) = writer.as_ref() {
+                        if active_writer.try_save(database.cached_state(history_limit)).is_ok() {
+                            persist_dirty = false;
+                        }
+                    } else {
+                        persist_dirty = false;
+                    }
                 }
             }
         }
+    }
+    if let Some(active_writer) = writer
+        && let Err(error) = active_writer
+            .shutdown(database.cached_state(history_limit))
+            .await
+    {
+        log::error!("cache flush failed after storage channel closed: {error}");
+    }
+}
+
+impl StorageCommand {
+    fn persists(&self) -> bool {
+        matches!(
+            self,
+            Self::AddMessage { .. }
+                | Self::AddChat(_)
+                | Self::ResolveContact { .. }
+                | Self::UpdatePushName(..)
+                | Self::UpdatePushNames(_)
+                | Self::RefreshContactNames
+                | Self::UpdateChatUnread(..)
+                | Self::MarkChatRead(..)
+                | Self::MarkMessageRevoked(..)
+        )
     }
 }
 
@@ -314,6 +489,13 @@ fn apply_storage_command(
             let _ = reply.send(database.message_info(&id));
             false
         }
+        StorageCommand::MessagesNeedingHydration(ids, reply) => {
+            let _ = reply.send(database.messages_needing_hydration(ids));
+            false
+        }
+        StorageCommand::SetAccount(..)
+        | StorageCommand::ClearCache(..)
+        | StorageCommand::Close(..) => unreachable!("handled by storage actor"),
     }
 }
 
@@ -328,6 +510,69 @@ pub struct MessageDatabase {
 }
 
 impl MessageDatabase {
+    fn from_cached(state: CachedState) -> Self {
+        let mut database = Self {
+            next_activity_order: state.next_activity_order,
+            ..Default::default()
+        };
+        for contact in state.contacts {
+            database.contacts.insert(contact.id.clone(), contact);
+        }
+        for (chat, order) in state.chats {
+            if let Some(order) = order {
+                database.chat_activity_order.insert(chat.id.clone(), order);
+            }
+            database.chats.insert(chat.id.clone(), chat);
+        }
+        for message in state.messages {
+            database
+                .message_chat_by_id
+                .insert(message.id.clone(), message.chat_id.clone());
+            database
+                .messages
+                .entry(message.chat_id.clone())
+                .or_default()
+                .push(message);
+        }
+        database
+    }
+
+    fn cached_state(&self, history_limit: usize) -> CachedState {
+        let mut contacts = self.contacts.values().cloned().collect::<Vec<_>>();
+        contacts.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut chats = self
+            .chats
+            .values()
+            .cloned()
+            .map(|chat| {
+                let order = self.chat_activity_order.get(&chat.id).copied();
+                (chat, order)
+            })
+            .collect::<Vec<_>>();
+        chats.sort_by(|a, b| a.0.id.cmp(&b.0.id));
+        let mut messages = Vec::new();
+        for stored in self.messages.values() {
+            let start = if history_limit == 0 {
+                0
+            } else {
+                stored.len().saturating_sub(history_limit)
+            };
+            messages.extend(stored[start..].iter().cloned());
+        }
+        CachedState {
+            contacts,
+            chats,
+            messages,
+            next_activity_order: self.next_activity_order,
+        }
+    }
+
+    fn messages_needing_hydration(&self, ids: Vec<String>) -> HashSet<String> {
+        ids.into_iter()
+            .filter(|id| self.message(id).is_none_or(message_needs_hydration))
+            .collect()
+    }
+
     pub fn add_message(&mut self, msg: Message, mark_unread: bool) -> bool {
         self.store_message(msg, mark_unread, true)
     }
@@ -688,6 +933,16 @@ impl MessageDatabase {
     }
 }
 
+fn message_needs_hydration(message: &Message) -> bool {
+    match message.kind {
+        MessageKind::Unknown => true,
+        MessageKind::Text => false,
+        MessageKind::Image | MessageKind::Video | MessageKind::Audio | MessageKind::Document => {
+            message.raw_message.is_none()
+        }
+    }
+}
+
 fn message_preview(message: &Message) -> String {
     let text = message
         .text
@@ -716,6 +971,8 @@ fn trim_jid(id: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn message(id: &str, chat: &str, timestamp: u64) -> Message {
         Message {
@@ -728,6 +985,40 @@ mod tests {
             kind: MessageKind::Text,
             ..Default::default()
         }
+    }
+
+    fn temp_cache(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("whatscli-{label}-{}-{nonce}", std::process::id()))
+            .join("cache.db")
+    }
+
+    async fn stop(storage: StorageHandle, task: JoinHandle<()>) {
+        storage.close().await.unwrap();
+        task.await.unwrap();
+    }
+
+    async fn selected_snapshot(
+        storage: &StorageHandle,
+        ui_rx: &mut mpsc::Receiver<UiEvent>,
+        chat: &str,
+    ) -> DatabaseSnapshot {
+        storage.select(chat.to_owned()).await.unwrap();
+        tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                if let Some(UiEvent::Snapshot(snapshot)) = ui_rx.recv().await
+                    && snapshot.selected_chat == chat
+                {
+                    break snapshot;
+                }
+            }
+        })
+        .await
+        .unwrap()
     }
 
     #[test]
@@ -924,7 +1215,7 @@ mod tests {
     #[tokio::test]
     async fn storage_actor_coalesces_mutations_into_a_consistent_snapshot() {
         let (ui_tx, mut ui_rx) = mpsc::channel(QUEUE_CAPACITY);
-        let (storage, task) = start_storage_actor(ui_tx);
+        let (storage, task) = start_storage_actor(ui_tx, PathBuf::new(), None, 200).await;
         let chat = "123@s.whatsapp.net";
         storage.select(chat.into()).await.unwrap();
         for index in 0..3 {
@@ -953,6 +1244,254 @@ mod tests {
                 .await
                 .is_err()
         );
-        task.abort();
+        storage.close().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_restores_conversations_contacts_previews_unread_payloads_and_order() {
+        let path = temp_cache("restore");
+        let account = "owner@s.whatsapp.net";
+        let first_chat = "111@s.whatsapp.net";
+        let second_chat = "group@g.us";
+        let (ui_tx, _ui_rx) = mpsc::channel(QUEUE_CAPACITY);
+        let (storage, task) =
+            start_storage_actor(ui_tx, path.clone(), Some(account.into()), 20).await;
+        storage
+            .resolve_contact(first_chat.into(), "Alice Saved".into(), "Alice".into())
+            .await
+            .unwrap();
+        let mut first = message("first", first_chat, 100);
+        first.text = "persisted preview".into();
+        first.contact_name = "Alice Saved".into();
+        storage.add_message(first, true).await.unwrap();
+        storage
+            .add_chat(Chat {
+                id: second_chat.into(),
+                is_group: true,
+                name: "Family".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut media = message("media", second_chat, 200);
+        media.kind = MessageKind::Image;
+        media.text = "holiday".into();
+        media.raw_message = Some(std::sync::Arc::new(
+            whatsapp_rust::waproto::whatsapp::Message {
+                image_message: Some(Box::default()),
+                ..Default::default()
+            },
+        ));
+        storage.add_message(media, false).await.unwrap();
+        stop(storage, task).await;
+
+        let (ui_tx, mut ui_rx) = mpsc::channel(QUEUE_CAPACITY);
+        let (storage, task) =
+            start_storage_actor(ui_tx, path.clone(), Some(account.into()), 20).await;
+        let initial = ui_rx.recv().await.unwrap();
+        let UiEvent::Snapshot(initial) = initial else {
+            panic!("expected initial snapshot")
+        };
+        assert_eq!(
+            initial
+                .chats
+                .iter()
+                .map(|chat| chat.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![second_chat, first_chat]
+        );
+        let restored_first = initial
+            .chats
+            .iter()
+            .find(|chat| chat.id == first_chat)
+            .unwrap();
+        assert_eq!(restored_first.name, "Alice Saved");
+        assert_eq!(restored_first.preview, "persisted preview");
+        assert_eq!(restored_first.unread, 1);
+        let snapshot = selected_snapshot(&storage, &mut ui_rx, second_chat).await;
+        assert_eq!(snapshot.messages.len(), 1);
+        assert!(snapshot.messages[0].raw_message.is_some());
+        assert_eq!(snapshot.messages[0].text, "holiday");
+        stop(storage, task).await;
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_prunes_each_chat_but_backlog_stays_in_the_current_session() {
+        let path = temp_cache("prune");
+        let account = "owner@s.whatsapp.net";
+        let chat = "111@s.whatsapp.net";
+        let (ui_tx, mut ui_rx) = mpsc::channel(QUEUE_CAPACITY);
+        let (storage, task) =
+            start_storage_actor(ui_tx, path.clone(), Some(account.into()), 2).await;
+        for index in 0..5 {
+            storage
+                .add_historical_message(message(&format!("msg-{index}"), chat, index), false)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            selected_snapshot(&storage, &mut ui_rx, chat)
+                .await
+                .messages
+                .len(),
+            5
+        );
+        stop(storage, task).await;
+
+        let (ui_tx, mut ui_rx) = mpsc::channel(QUEUE_CAPACITY);
+        let (storage, task) =
+            start_storage_actor(ui_tx, path.clone(), Some(account.into()), 2).await;
+        let restored = selected_snapshot(&storage, &mut ui_rx, chat).await;
+        assert_eq!(
+            restored
+                .messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["msg-3", "msg-4"]
+        );
+        stop(storage, task).await;
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn zero_history_limit_keeps_all_cached_messages() {
+        let path = temp_cache("unlimited");
+        let account = "owner@s.whatsapp.net";
+        let chat = "111@s.whatsapp.net";
+        let (ui_tx, _ui_rx) = mpsc::channel(QUEUE_CAPACITY);
+        let (storage, task) =
+            start_storage_actor(ui_tx, path.clone(), Some(account.into()), 0).await;
+        for index in 0..4 {
+            storage
+                .add_historical_message(message(&format!("msg-{index}"), chat, index), false)
+                .await
+                .unwrap();
+        }
+        stop(storage, task).await;
+        let (ui_tx, mut ui_rx) = mpsc::channel(QUEUE_CAPACITY);
+        let (storage, task) =
+            start_storage_actor(ui_tx, path.clone(), Some(account.into()), 0).await;
+        assert_eq!(
+            selected_snapshot(&storage, &mut ui_rx, chat)
+                .await
+                .messages
+                .len(),
+            4
+        );
+        stop(storage, task).await;
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn hydration_query_skips_complete_records_and_retries_incomplete_ones() {
+        let (ui_tx, _ui_rx) = mpsc::channel(QUEUE_CAPACITY);
+        let (storage, task) = start_storage_actor(ui_tx, PathBuf::new(), None, 20).await;
+        let chat = "111@s.whatsapp.net";
+        let mut complete = message("complete", chat, 1);
+        complete.text = "hello".into();
+        storage.add_message(complete, false).await.unwrap();
+        let mut incomplete = message("incomplete", chat, 2);
+        incomplete.kind = MessageKind::Unknown;
+        storage.add_message(incomplete, false).await.unwrap();
+        let needed = storage
+            .messages_needing_hydration(vec![
+                "complete".into(),
+                "incomplete".into(),
+                "missing".into(),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(
+            needed,
+            HashSet::from(["incomplete".into(), "missing".into()])
+        );
+        let mut hydrated = message("incomplete", chat, 2);
+        hydrated.text = "recovered".into();
+        storage
+            .add_historical_message(hydrated, false)
+            .await
+            .unwrap();
+        assert!(
+            storage
+                .messages_needing_hydration(vec!["incomplete".into()])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        stop(storage, task).await;
+    }
+
+    #[tokio::test]
+    async fn cache_persists_read_revocation_and_name_mutations() {
+        let path = temp_cache("mutations");
+        let account = "owner@s.whatsapp.net";
+        let chat = "111@s.whatsapp.net";
+        let (ui_tx, _ui_rx) = mpsc::channel(QUEUE_CAPACITY);
+        let (storage, task) =
+            start_storage_actor(ui_tx, path.clone(), Some(account.into()), 20).await;
+        let mut original = message("message", chat, 1);
+        original.contact_name = "111".into();
+        original.contact_short = "111".into();
+        original.text = "remove me".into();
+        storage.add_message(original, true).await.unwrap();
+        storage
+            .update_push_name(chat.into(), "111".into(), "Alice".into())
+            .await
+            .unwrap();
+        assert_eq!(storage.mark_chat_read(chat.into()).await.unwrap().len(), 1);
+        assert!(
+            storage
+                .mark_message_revoked("message".into())
+                .await
+                .unwrap()
+        );
+        stop(storage, task).await;
+
+        let (ui_tx, mut ui_rx) = mpsc::channel(QUEUE_CAPACITY);
+        let (storage, task) =
+            start_storage_actor(ui_tx, path.clone(), Some(account.into()), 20).await;
+        let restored = selected_snapshot(&storage, &mut ui_rx, chat).await;
+        assert_eq!(restored.chats[0].name, "Alice");
+        assert_eq!(restored.chats[0].unread, 0);
+        assert_eq!(restored.messages[0].text, "[message revoked]");
+        assert_eq!(restored.messages[0].kind, MessageKind::Unknown);
+        assert!(!restored.messages[0].unread);
+        stop(storage, task).await;
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_is_isolated_between_accounts_and_cleanup_removes_sidecars() {
+        let path = temp_cache("account");
+        let chat = "111@s.whatsapp.net";
+        let (ui_tx, _ui_rx) = mpsc::channel(QUEUE_CAPACITY);
+        let (storage, task) =
+            start_storage_actor(ui_tx, path.clone(), Some("a@wa".into()), 20).await;
+        storage
+            .add_message(message("private", chat, 1), false)
+            .await
+            .unwrap();
+        stop(storage, task).await;
+
+        let (ui_tx, mut ui_rx) = mpsc::channel(QUEUE_CAPACITY);
+        let (storage, task) =
+            start_storage_actor(ui_tx, path.clone(), Some("b@wa".into()), 20).await;
+        let UiEvent::Snapshot(snapshot) = ui_rx.recv().await.unwrap() else {
+            panic!()
+        };
+        assert!(snapshot.chats.is_empty());
+        storage.clear_cache().await.unwrap();
+        for file in cache::database_files(&path) {
+            assert!(
+                !Path::new(&file).exists(),
+                "{} still exists",
+                file.display()
+            );
+        }
+        stop(storage, task).await;
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }

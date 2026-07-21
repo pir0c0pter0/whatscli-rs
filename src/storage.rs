@@ -19,7 +19,12 @@ pub struct StorageHandle {
 
 enum StorageCommand {
     Select(String),
-    AddMessage(Message, bool, oneshot::Sender<bool>),
+    AddMessage {
+        message: Message,
+        mark_unread: bool,
+        promote_chat: bool,
+        reply: oneshot::Sender<bool>,
+    },
     AddChat(Chat),
     ResolveContact {
         id: String,
@@ -58,9 +63,31 @@ impl StorageHandle {
     }
 
     pub async fn add_message(&self, message: Message, mark_unread: bool) -> Result<bool> {
+        self.store_message(message, mark_unread, true).await
+    }
+
+    pub async fn add_historical_message(
+        &self,
+        message: Message,
+        mark_unread: bool,
+    ) -> Result<bool> {
+        self.store_message(message, mark_unread, false).await
+    }
+
+    async fn store_message(
+        &self,
+        message: Message,
+        mark_unread: bool,
+        promote_chat: bool,
+    ) -> Result<bool> {
         let (reply, response) = oneshot::channel();
-        self.send(StorageCommand::AddMessage(message, mark_unread, reply))
-            .await?;
+        self.send(StorageCommand::AddMessage {
+            message,
+            mark_unread,
+            promote_chat,
+            reply,
+        })
+        .await?;
         response
             .await
             .map_err(|_| anyhow!("storage worker stopped"))
@@ -202,8 +229,13 @@ fn apply_storage_command(
             *selected_chat = chat_id;
             true
         }
-        StorageCommand::AddMessage(message, unread, reply) => {
-            let _ = reply.send(database.add_message(message, unread));
+        StorageCommand::AddMessage {
+            message,
+            mark_unread,
+            promote_chat,
+            reply,
+        } => {
+            let _ = reply.send(database.store_message(message, mark_unread, promote_chat));
             true
         }
         StorageCommand::AddChat(chat) => {
@@ -282,10 +314,16 @@ pub struct MessageDatabase {
     messages_by_id: HashMap<String, Message>,
     chats: HashMap<String, Chat>,
     contacts: HashMap<String, Contact>,
+    chat_activity_order: HashMap<String, u64>,
+    next_activity_order: u64,
 }
 
 impl MessageDatabase {
-    pub fn add_message(&mut self, mut msg: Message, mark_unread: bool) -> bool {
+    pub fn add_message(&mut self, msg: Message, mark_unread: bool) -> bool {
+        self.store_message(msg, mark_unread, true)
+    }
+
+    fn store_message(&mut self, mut msg: Message, mark_unread: bool, promote_chat: bool) -> bool {
         if let Some(existing) = self.messages_by_id.get_mut(&msg.id) {
             if existing.raw_message.is_none() && msg.raw_message.is_some() {
                 existing.raw_message = msg.raw_message.take();
@@ -315,6 +353,11 @@ impl MessageDatabase {
         messages.push(msg.clone());
         messages.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
         self.update_chat_from_message(&msg, mark_unread);
+        if promote_chat {
+            self.next_activity_order = self.next_activity_order.saturating_add(1);
+            self.chat_activity_order
+                .insert(msg.chat_id.clone(), self.next_activity_order);
+        }
         true
     }
 
@@ -534,8 +577,17 @@ impl MessageDatabase {
     pub fn chats(&self) -> Vec<Chat> {
         let mut chats: Vec<_> = self.chats.values().cloned().collect();
         chats.sort_by(|a, b| {
-            b.last_message
-                .cmp(&a.last_message)
+            let a_activity = self.chat_activity_order.get(&a.id).copied();
+            let b_activity = self.chat_activity_order.get(&b.id).copied();
+            b_activity
+                .is_some()
+                .cmp(&a_activity.is_some())
+                .then_with(|| {
+                    b_activity
+                        .unwrap_or_default()
+                        .cmp(&a_activity.unwrap_or_default())
+                })
+                .then_with(|| b.last_message.cmp(&a.last_message))
                 .then_with(|| a.name.cmp(&b.name))
         });
         chats
@@ -749,6 +801,55 @@ mod tests {
             db.chats().iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
             vec![newer, older]
         );
+    }
+
+    #[test]
+    fn equal_timestamps_are_ordered_by_message_arrival() {
+        let mut db = MessageDatabase::default();
+        let first_chat = "5511@s.whatsapp.net";
+        let second_chat = "5522@s.whatsapp.net";
+        let mut first = message("first", first_chat, 100);
+        first.contact_name = "Ana".into();
+        let mut second = message("second", second_chat, 100);
+        second.contact_name = "Zoe".into();
+
+        db.add_message(first, false);
+        db.add_message(second, false);
+
+        assert_eq!(
+            db.chats()
+                .iter()
+                .map(|chat| chat.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![second_chat, first_chat]
+        );
+    }
+
+    #[test]
+    fn delayed_new_message_promotes_its_chat() {
+        let mut db = MessageDatabase::default();
+        let newer_chat = "5511@s.whatsapp.net";
+        let delayed_chat = "5522@s.whatsapp.net";
+        db.store_message(message("newer", newer_chat, 200), false, false);
+        db.store_message(message("older", delayed_chat, 100), false, false);
+        assert_eq!(db.chats()[0].id, newer_chat);
+
+        db.add_message(message("delayed", delayed_chat, 50), false);
+
+        assert_eq!(db.chats()[0].id, delayed_chat);
+        assert_eq!(db.chats()[0].last_message, 100);
+    }
+
+    #[test]
+    fn historical_messages_do_not_override_live_arrival_order() {
+        let mut db = MessageDatabase::default();
+        let live_chat = "5511@s.whatsapp.net";
+        let history_chat = "5522@s.whatsapp.net";
+        db.add_message(message("live", live_chat, 100), false);
+
+        db.store_message(message("history", history_chat, 200), false, false);
+
+        assert_eq!(db.chats()[0].id, live_chat);
     }
 
     #[test]

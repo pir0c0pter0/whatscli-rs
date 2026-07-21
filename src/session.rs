@@ -1190,7 +1190,7 @@ async fn handle_history(
                 continue;
             };
             if let Some(message) = message_from_info(&info, Arc::new(raw.clone()), storage).await {
-                storage.add_message(message, false).await?;
+                storage.add_historical_message(message, false).await?;
             }
         }
         storage
